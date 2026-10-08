@@ -1,0 +1,15 @@
+Colony machinery ambience clips — downloaded from the internet, converted to
+mono 22 kHz MP3 (loudness-normalized, faded). Sources & licenses:
+
+compressor.mp3  — "Aircompressor" from "12 Ambient Machine Sounds"
+                  (opengameart.org/content/12-ambient-machine-sounds, CC-BY 3.0)
+ventilation.mp3 — "fan_1" from "12 Ambient Machine Sounds"
+                  (opengameart.org/content/12-ambient-machine-sounds, CC-BY 3.0)
+pump.mp3        — "Steamboat Engine Sound" (opengameart.org/content/steamboat-engine-sound, CC0)
+hydraulics.mp3  — "Steam boiler sound loop" (opengameart.org/content/steam-boiler-sound-loop, CC0)
+generator.mp3   — "Generator (loop)" (opengameart.org/content/generator-loop, CC0)
+servo.mp3       — "Electronic device loop" by qubodup (opengameart.org/content/electronic-device-loop, CC0)
+
+Rover drive audio: public/sounds/rover-drive.mp3 — NASA/JPL-Caltech
+"Sounds of Perseverance Mars Rover Driving – Sol 16" (public domain).
+Background music: public/sounds/bgm-breath-on-the-glass.mp3 — user-supplied.

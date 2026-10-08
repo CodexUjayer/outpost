@@ -1,0 +1,146 @@
+# Project Worklog — Off-World Colony STEM Game
+
+---
+Task ID: 1
+Agent: main (Z.ai Code)
+Task: Setup and planning for realistic lunar/Mars colony-building STEM game (Next.js 16 + React Three Fiber)
+
+Work Log:
+- Inspected project: Next.js 16 App Router, React 19, shadcn/ui full set, zustand, TypeScript.
+- Installed three, @types/three, @react-three/fiber (v9), @react-three/drei (v10).
+- Planned architecture:
+  - src/game/*: types, noise, terrain math, building defs, zustand store, simulation tick, events, audio engine (procedural Web Audio).
+  - src/components/game/*: GameRoot (canvas+UI), Scene (world), Terrain, SkyDome, Player (FP + arms), Buildings, Rover, cinematics (landing, construction), HUD/menus.
+  - Single page app on "/" — first-person EVA gameplay + third-person cinematic construction sequences.
+  - Simulation: power/battery, O2, water, food, materials, radiation dose, temperature, population, structural integrity; dynamic events; 7-phase progression with milestones.
+
+Stage Summary:
+- Dependencies installed. Architecture defined. Core data contracts being written next (types/store/buildings/sim/events), then parallel subagent tasks for audio engine + HUD UI.
+
+---
+Task ID: 3-b
+Agent: hud-ui subagent
+Task: HUD, BuildMenu, ColonyPanel, Menus, SkipButton components
+
+Work Log:
+- Read worklog, types.ts, store.ts, buildings.ts, simulation.ts (phaseName helper verified), events.ts (severity shapes), tsconfig paths, shadcn ui inventory (button/tabs APIs), verified lucide-react 0.525 icon exports (Radiation, Wheat, ShieldCheck, Boxes, CheckCircle2, AlertOctagon all present).
+- Wrote src/components/game/HUD.tsx: pointer-events-none fixed overlay (z-40) rendered only when screen==='playing'. Centered mono top bar with 9 resource stats (power %+net flow from battery.in-out, O2/H2O/food amount/cap + per-sol trend arrows from rates, radiation dose mSv with storm pulse, materials, temp, crew pop/popCap + crewHealth micro-bar, avg building integrity) with stone/amber/red semantic tones; top-left mission panel (PHASE via phaseName(), SOL, HH:MM clock from timeOfDay, 1x/4x/12x + pause buttons, objectives checklist); top-right framer-motion toasts colored by kind; top-center blackout/brownout mini-banners + severe-event banner keyed by first severe event id; center crosshair + [E] interaction prompt with SVG hold-progress ring; bottom-center placement banner (name, cost, cancel button, invalidPlacement); bottom-left collapsible 40%-opacity controls hint; bottom-center radio subtitle with 7s fade; bottom-right EVA suit-O2 gauge / PRESSURIZED badge + Colony[Tab]/Build[B] shortcut buttons.
+- Wrote BuildMenu.tsx: CONSTRUCTION FABRICATOR bottom panel (max-w-3xl, grid-cols-2 md:grid-cols-3) over BUILD_ORDER; per-card name, materials cost (red when unaffordable), desc, power draw, footprint; locked cards show Lock + "PHASE X" (click still routes through beginPlacement so the store explains why); header shows live materials count + close.
+- Wrote ColonyPanel.tsx: centered dialog-style overlay (z-50, backdrop click to close) with shadcn Tabs: Systems (all buildings incl. lander as "Lander — Base Camp", online dot by health, health bar, power draw, conditional "Repair 4 mats" button disabled when materials < 4; production/consumption per-sol rate table; battery bar, radiation dose, crew stats), Research (research pts + UPGRADES cards with owned/INSTALL states, disabled when unaffordable), Log (newest-first, colored, max-h-64 scroll).
+- Wrote Menus.tsx: screen router. Start menu: CSS radial-gradient + deterministic box-shadow starfield, OFFWORLD title block, Moon/Mars planet cards from PLANETS (gravity/solar/rad stats + derived hazards, amber ring when selected), expandable MISSION BRIEFING listing the selected planet's facts, controls summary, BEGIN LANDING SEQUENCE -> startGame(sel), procedural-audio footer. Pause overlay (resume/restart + controls). Game over (red-tinted: failureReason, sols/pop/events stats, STEM "what went wrong" chain note, restart). Victory (emerald/amber-tinted: victoryStats guarded, ISRU + closed-loop life-support field notes, Continue observing -> setScreen('playing'), New mission -> restart()). 'landing' renders null.
+- Wrote SkipButton.tsx: fixed bottom-right when construction active or screen==='landing'; calls skipConstruction() or setScreen('playing'); shows "HOLD F" kbd hint.
+- Fixed the new react-hooks/set-state-in-effect ESLint errors in HUD by deriving banner/radio visibility from state (expired-id sets) and only calling setState inside async timer callbacks.
+- Verify: full-project `bunx tsc --noEmit` filtered to my 5 files = 0 errors (strict); `bun run lint` filtered to components/game = clean. Bare-CLI tsc without tsconfig paths shows expected unresolved-@/ import noise only (paths resolve under the project tsconfig).
+
+Stage Summary:
+- 5 UI-layer components shipped (HUD, BuildMenu, ColonyPanel, Menus, SkipButton), all 'use client', zustand-driven, strict-typed, lint-clean, no blue/indigo palette (stone/amber/emerald/red only).
+- Store contract notes: battery.in/out and rates.* are per-sol units (used for trend indicators); restart() returns to menu screen; lander is a BuildingInstance with id 'lander'/type 'depot'; toasts auto-expire in store after 6s (HUD just renders them); interactionProgress 0..1 drives the SVG ring.
+- Minor gaps noticed (coded around, no store changes): invalidPlacement surfaced in placement banner; exact power trend unit inferred as /sol from simulation; BuildMenu intentionally shows phase-locked buildings dimmed (spec was ambiguous) since beginPlacement already guards.
+
+---
+Task ID: 3-a
+Agent: audio-engine subagent
+Task: Procedural Web Audio engine (src/game/audio.ts)
+
+Work Log:
+- Read worklog for context (no other game files touched; engine is fully self-contained, zero imports).
+- Wrote src/game/audio.ts (~1740 lines): 100% procedural Web Audio engine — no audio files, no fetch, no external assets.
+- Core: single shared AudioContext (AudioContext/webkitAudioContext guarded, SSR-safe via typeof window check); master chain masterGain -> DynamicsCompressor (-16 thr / 18 knee / 5:1 / 4ms / 240ms) -> destination; two shared 2s noise buffers (white + integrated/normalized brown) reused by every noise-based sound via AudioBufferSourceNodes.
+- Ambience (persistent layers, all crossfaded with setTargetAtTime — never hard switches): outside wind = lowpassed white + brown beds with slow LFO modulation, planet-flavored (moon = bandpass ~1050Hz thin/airy, mars = lower/rumblier ~480Hz + more brown), storm layer raises wind heavily + adds bandpass rattle; interior room tone fades in when inside; fan = hum (saw through lowpass) + bandpass air noise scaled by intensity and gated toward inside; breathing = bandpass (~430Hz) white noise with rectified-WaveShaper LFO envelope ~0.25Hz (effort scales toward ~0.5Hz + opens filter/volume); heartbeat = scheduled dual-sine low thumps on dedicated bus, 0..1 intensity gates bus gain; alarm = scheduler-driven alternating soft two-tone 660/880Hz caution beeps.
+- Vehicle loops: rover engine = pitch-tracked saw+sub sine through sweeping lowpass + wheel-noise bed (throttle-mapped 74-166Hz); construction motor = servo bandpass whine + hydraulic low pulse; landing burn = brown rumble + highpassed hiss layers with slow 0.45s fade-in.
+- One-shots: footstep (regolith muffled crunch w/ second grit grain vs metal clang-tap + ring), interactBlip, denyBlip (descending two-tone), toolWrench (randomized ratchet spikes on shared noise + final clack), toolWeld (sputtering highpassed arc + crackle taps + 118Hz hum), airlock (valve snap + lowpass-swept pressure hiss + end clunk), doorServo (wobbling filtered saw + end clicks), radioBlip (squelch click), radioVoice (bandpass 1.75kHz noise w/ filter wobble + random-pitch sawtooth babble, random syllable gain envelopes 0.05-0.16s, squelch clicks at both ends — unintelligible but convincing), alarmPing, thud (58->27Hz sub sweep + brown impact), meteorBoom (realistic: lowpassed brown swell, 42->28Hz sub tail, sparse 3.1kHz grit crackle — muffled/distant, NOT Hollywood), leakHiss (returns handle; fluting bandpass hiss loop, panner at listener), touchdown (95Hz dust thump + puff + decaying settling-grit ticks), success (soft 660/880 chime), constructorCue stages 0-3 (rover approach w/ brake hiss + clunk / crane servo steps + hydraulic thunk / weld arc + tones / ascending three-tone complete).
+- Spatialization: PannerNode panningModel 'equalpower', distanceModel 'inverse', refDistance 3, rolloffFactor 1.2, maxDistance 10000; setListener updates AudioListener each frame with legacy setPosition/setOrientation fallbacks.
+- Frame-safety: every public method no-ops before init() (and try/catch inside); desired-state caching (epsilon gates 0.01-0.02) keeps per-frame calls cheap; state set before init is replayed after init; one-shot concurrency capped at 24 (guard()) with onended-driven decrement + node disconnect cleanup; loop registry (Map) with killLoop fades for stopLoop/loop replacement; scheduler uses a single 200ms setInterval for alarm+heartbeat.
+- API note: also exposes an extra setDoppler(on) legacy toggle (harmless addition; all required API present and exact).
+- Verify: `bunx tsc --noEmit --strict --skipLibCheck --target es2020 --module esnext --moduleResolution bundler src/game/audio.ts` = clean (exit 0). `bun run lint` = project-wide exit 0, zero errors, nothing mentioning audio.ts.
+
+Stage Summary:
+- src/game/audio.ts shipped: self-contained procedural audio engine, strict-TS clean, lint clean, singleton `audio` exported.
+- API contract implemented exactly as specced: init/resume/suspend/setMasterVolume/setListener; continuous setEnvironment/setFan/setAlarm/setBreathing/setHeartbeat/setRoverEngine/setConstructionMotor (+landingBurn); one-shots footstep/interactBlip/denyBlip/toolWrench/toolWeld/airlock/doorServo/radioBlip/radioVoice/alarmPing/thud/meteorBoom/touchdown/success/constructorCue; leakHiss() -> handle string; stopLoop(handle)/setLoopPosition(handle, pos).
+- Integration notes for consumers: call audio.init() from first user gesture (e.g. BEGIN LANDING click); call setListener(pos, forward) every frame; setEnvironment/setFan/etc. are cheap enough for per-frame calls (epsilon-gated); leakHiss returns '' if not ready — always pass handle to stopLoop; loops started before init() are auto-replayed once init runs.
+
+---
+Task ID: 5
+Agent: Z.ai Code (main)
+Task: Fix broken first-person hands in the FP astronaut body (Arms.tsx) — palms faced up, fingers splayed backwards, wrists hyperextended; also fix the white-torso dome when looking steeply down and the floating multitool/wrist display.
+
+Work Log:
+- Diagnosed root cause in src/components/game/Arms.tsx: hand orientation used THREE.Quaternion.setFromUnitVectors (minimal-arc) from the current finger direction to a camera-space aim — controls where fingers point but leaves hand ROLL uncontrolled, so palms ended up facing up with fingers curled backwards (looked broken).
+- Probed the GLB rig in the live page (added debug exposure of the loaded scene + THREE on window.__astro, and window.__fpBody for the built FP body): confirmed scaleCompensation wrapper nodes are identity-rotation (pure translation), measured rest-pose axes per hand (finger axis local ≈ (0, 0.97, 0.24), thumb1 direction, palm normal via cross product with inward-sign check — mirrored between hands), arms hang at rest.
+- Rewrote the arm solver: analytic 2-bone IK (law of cosines + elbow pole) retained for positions, but hand + forearm orientations now use a full basis-match (measured rest frame mapped onto camera-space targets) — fingers → AIM_CAM (forward, slightly down), palm → PALM_R/L_CAM (inward, tipped down). Forearm roll matches the hand's thumb direction so the sleeve cuff stays continuous. Upper arm keeps minimal-arc (position pinned; residual roll only affects the sleeve tube).
+- Added a procedural finger rig: collects all 30 finger joints (Index/Mid/Ring/Pinky/Thumb × 3), measures each joint's bend axis (cross of down-chain direction and palm normal, in rest-local space), applies gentle curl + idle wobble; curl deepens 1.6× while interacting (grip). Added an abduction correction on joint-1 pulling the model's mannequin finger fan (~80° rest) 75% back toward the middle finger — verified rendered fingertip spread is now 20-25° (natural).
+- Fixed "white dome fills screen when looking down": added a collarbone pitch pivot (model reparented under a group at neck height; lean = -pitch × 0.26 with smoothing + foot-sink compensation (1-cos)·neckY) and a normalized horizontal body back-offset that grows with down-pitch (BODY_BACK + max(0,-pitch)×0.22) so the camera never ends up inside the chest.
+- Multitool is now gripped: posed from the right hand's solved world frame (Q_TOOL_LOCAL basis-matched so tool -Z rides the finger axis, offset along the palm) instead of a camera-locked lerp. Wrist display rides the left forearm frame (long axis along the bone, screen on the back of the wrist) instead of floating camera-anchored.
+- Hid the FP body during construction cinematics (visible condition now also requires !st.construction).
+- Raised hand rest targets slightly (T_R (0.21,-0.10,-0.42), T_L (-0.21,-0.13,-0.36)) for better framing.
+- Verified in-browser via agent-browser at multiple pitches (neutral, -0.35, -0.5, -1.2 steep down, +0.9 up): runtime probes confirmed finger world direction matches the aim exactly for both hands, palm normals match the commanded inward-down targets, tool forward aligned with fingers, fingertip fan natural. Walked, opened build menu, placed a Solar Array, skipped the cinematic — arms hide during cinematics, gameplay flow (objectives completed) unaffected. `bun run lint` clean; fresh full reload flow (menu → landing → skip → play) verified.
+
+Stage Summary:
+- First-person hands are fixed: roll-controlled IK gives anatomically stable gloved hands (fingers forward-down, palms inward) built from the user's astronaut GLB's own hand bones; procedural finger curl/grip; no more broken palms-up wrists.
+- Looking steeply down now shows arms/shoulders/suit instead of clipping into a white torso dome; hands + tool + wrist display all ride the solved skeleton frames.
+- Debug probes left in place (window.__astro, window.__fpBody, window.__fp) for future rig inspection; zero runtime errors in console; lint clean.
+
+---
+Task ID: 6
+Agent: Z.ai Code (main)
+Task: (a) Replace photo soil textures with fully procedural Moon/Mars soil setups (hyper-realistic, bumpy, craters, dust). (b) Fix the STILL-broken FP fingers (splayed/hyperextending fan that survived the Task-5 hand fix).
+
+Work Log:
+- Terrain photo-texture attempt (moon_soil.jpg / mars_soil.jpg via useLoader) was rejected by the user → removed public/textures and reverted to procedural.
+- Created src/game/soil.ts — Procedural Moon Soil Setup + Procedural Mars Soil Setup: seamless-tileable periodic value-noise (wrapped lattice), generating per planet a 1024² albedo + normal (Sobel from height field) + roughness canvas set: multi-octave mottling, dark maria/aeolian patches, bright dust veils, clumped grain speckle, hash-scattered pebbles stamped into the height field, 48-64 micro-craters (bowl + rim + ejecta halo brightening), patchy meandering dust ripples, bright ray systems (moon) / dark wind streaks (mars) drawn on the albedo. SOIL_REPEAT=32 (tile ≈ 10.6 m), cached per planet + warmupSoil() for the other planet after 4 s idle.
+- Rewrote Terrain.tsx: MeshStandardMaterial(map+normalMap+roughnessMap, vertexColors) from getSoilSetup(planet); vertex colors are now a near-white brightness modulation (patches/slope/dust) so the albedo carries the color (fixes double-darkening); added visual-only micro relief (±1.3 cm meander ripples + ±2.2 cm fine noise) on top of heightAt; SEG 150→200.
+- Upgraded src/game/terrain.ts heightfield (shared with physics): big craters now bowl + crowned rim + ejecta apron (1.75 r reach); 34 deterministic medium fresh craters (1.7-6.3 m, kept clear of spawn); hash-scattered sub-meter pockmarks with tiny rims on a 7 m grid; extra fine fbm undulation.
+- Tuned away first-pass artifacts: moiré/corduroy striping (ripple amplitude/wavelength, patchy ripple mask, normalK 52→38/40→36), static-like grain (clumped by mid-scale dust mask), darkness (vertex tint now 88% white).
+- Hand fix root cause (the Task-5 basis-match was correct but got fought at runtime): the GLB's mocap idle clip animates the arm/hand/finger joints INCLUDING the *_scaleCompensation wrapper nodes that carry finger joint POSITIONS; at animWeight 0.45 it dragged the gloves into a splayed fan the procedural finger rig (which only writes plain finger bones) could never cancel. Verified live by swapping in a filtered clip in the browser (fan disappeared).
+- Fix in code: cloneAstronaut() gained an animClip option; buildFPBody() passes a filtered idle clip (IDLE_STRIP regex removes Upperarm/Forearm/Hand_/Clavicle/Thumb/Index/Mid/Ring/Pinky/Twist tracks — torso/leg/neck only). Arms+hands are 100% procedural for the FP body.
+- Right hand now actually GRIPS the multitool (rest curl ×2.05, thumb ×1.35, left hand unchanged); left wrist display shrunk 0.11×0.05×0.06 → 0.072×0.03×0.042 so it reads as a device, not a brick over the palm.
+- Verified via agent-browser on both planets at pitch -0.55/-0.35/0.06/-1.05: no fan, relaxed left hand, tool gripped in right, natural wrists; steep look-down no longer fills screen with torso; moon horizon shows crater rims + hills; mars shows rust regolith + dark streaks + cratered buttes. bun run lint clean, no runtime errors in dev.log.
+
+Stage Summary:
+- Both planets now use pure procedural hyper-real soil (albedo+normal+roughness, seamless, deterministic) + richer cratered heightfield; photo textures removed.
+- FP fingers fixed for real: mocap no longer animates FP arm/hand/finger wrappers; right glove grips the multitool; wrist device sized correctly.
+- Debug probes (window.__astro, __fpBody, __fp) + tests/probe-hands.js remain for future rig work.
+
+---
+Task ID: 7
+Agent: Z.ai Code (main)
+Task: Integrate the user-uploaded NASA Curiosity Rover model as the game rover — realistic moving wheels, exit with a key, real rover sounds from the internet.
+
+Work Log:
+- Extracted upload/CuriosityRover.zip (NASA LightWave model by Ron L. Long: Rover3.obj, 270,532 verts, 169,232 faces, 297 materials, NO UVs/normals/mtl).
+- Analyzed geometry (tools/rover-analyze.ts): front = +Z (mast at z≈+57), wheels at z ≈ −70/0/+75 units, wheel Ø ≈ 36 units, ground at y=0 → scale 0.01389 (Ø36u → 0.50 m real Curiosity wheel) gives 2.78 × 1.99 × 2.50 m.
+- Wrote tools/rover-convert.ts (dependency-free): splits faces into body + 6 wheel groups (Wheels/Treads/Wheel_Hubs/Wheel_Pivot mats by spatial cluster), generates hard-edge-aware smooth normals (31° threshold, position-keyed dedup), maps 297 materials → 20 PBR color buckets (rubber/steel/alu/gold/copper/glass/swatches), bakes scale, writes a valid GLB directly (hand-built JSON+BIN chunks; JSON chunk padded with 0x20 — zero-padding broke JSON.parse first time; second bug: normal values were never written into the accessor — fixed both).
+- Output public/models/rover/curiosity.glb (14.2 MB, nodes: body, wheel_front/mid/rear_left/right; middle wheels outboard at ±1.16 m like the real rocker-bogie). Validated with tools/rover-validate.ts + GLTFLoader parse in bun (tools/rover-gltfprobe.ts).
+- Rewrote Rover.tsx around the GLB: useLoader + preload, per-mount clones; RoverModel (cinematics) renders body + 6 wheels at measured centers; drivable Rover spins wheel groups by ω = v/r (r=0.25) and steers front+rear corner wheels in opposite phase (STEER_SIGN, ±0.5 rad target, like Curiosity AKB); middle wheels fixed. Kept dust emission, terrain pitch/roll follow, engine audio calls.
+- Downloaded REAL rover audio from the internet: NASA "Sounds of Perseverance Mars Rover Driving – Sol 16" (assets.science.nasa.gov RAW mp3, 16 min 256 kbps) → trimmed 105 s steady-driving segment, mono 22 kHz 64 kbps → public/sounds/rover-drive.mp3 (845 KB).
+- audio.ts: loadRoverSample() fetches+decodes on init (fire-and-forget); setRoverEngine prefers the real buffer when ready — looping BufferSource → lowpass → gain, throttle maps to gain 0.16–0.71, lowpass 650–3050 Hz, playbackRate 0.82–1.22; procedural saw engine remains as fallback; exits fade the loop out.
+- Fixed pre-existing exit race: pressing E to exit re-boarded in the SAME frame (Player's useFrame saw driving=false + justPressed E + "Board rover" candidate). Fix: roverState.exitGuardUntil = now+900ms set on exit; boarding candidate suppressed until it expires; exit now also handled in Player's driving branch (robust); on exit the player is placed 2.3 m beside the rover (right side, terrain-corrected) instead of inside the mesh.
+- HUD controls hint gained "DRIVING: WASD — drive · E — exit rover"; ?debug=1 console now exposes game store + audio for probing.
+- Verified in browser (agent-browser): menu → landing → skip → playing; rover renders with correct Curiosity proportions next to the lander; E boards (driving:true, chase cam, crosshair hidden); wheel spin 0→0.51→16.56→19.94 rad with FL=FR identical; steering front +0.255 / rear −0.255; E exits and STAYS exited (guard verified), re-board after guard works; rover-drive.mp3 fetched (845,359 B) and decoded (105.0 s AudioBuffer). bun run lint clean; dev log compiles clean.
+
+Stage Summary:
+- The game rover is now the user's real NASA Curiosity model at authentic scale (Ø0.5 m wheels, 2.5 m long) with spinning wheels + opposite-phase corner steering, E-to-exit that reliably works, and the real Perseverance Sol-16 drive recording as the engine sound (procedural fallback kept).
+- Key artifacts: public/models/rover/curiosity.glb, public/sounds/rover-drive.mp3, tools/rover-{analyze,convert,validate,gltfprobe}.ts (re-runnable pipeline from upload/Rover3.obj).
+- roverState.exitGuardUntil guards boarding; wheel centers are baked constants in Rover.tsx from tools/rover_out_meta.json.
+
+---
+Task ID: 8
+Agent: Z.ai Code (main)
+Task: User feedback round — (a) rover "is not the model I gave"; (b) wheels auto-move when walking; (c) remove the "shush shush" background sound; (d) use user's Breath_On_The_Glass.mp3 as quiet background music; (e) hyper-realistic atmosphere/ambience; (f) rover sound missing; (g) random-interval machinery SFX from the internet.
+
+Work Log:
+- Investigated "model is not this": parsed upload/BlueMoon_AndyModel_v01.fbx with a hand-written FBX 7700 binary parser → it is a LANDER (Legs_Part_*, RCS_*, Stairs_Railing_*, PanelArm, BodyGEO — Blue Moon lander; belongs to the upcoming lander task), NOT a rover. The rover source is still CuriosityRover.zip (Rover3.obj). What was wrong: my earlier color-bucket conversion rendered the rover dark (high metalness + dim env), unlike the model's own reference render (Pic1.jpg: white painted body, mid-gray chevron wheels, bright fasteners, gold foil).
+- Rewrote tools/rover-convert.ts palette to match Pic1.jpg (Alu_Body 0.88 white metal 0.2, Wheel_Rubber mid-gray 0.34, brighter fasteners/suspension, lower metalness everywhere), regenerated public/models/rover/curiosity.glb (validated: 0 bad accessors), and boosted envMapIntensity to 1.5 on rover materials in Rover.tsx so the white body reads white in the night scene.
+- Fixed "wheels move when walking": wheel spin AND steering in Rover.tsx were partially driven by global input; now gated on driving (steerTarget only read while driving; wheels settle straight when parked). Verified: A pressed while walking → steer 0, spin 0.
+- Removed the rhythmic "shush… shush…" suit-breathing ambience (Scene.tsx no longer calls audio.setBreathing; comment documents why).
+- BGM: copied upload/Breath_On_The_Glass.mp3 → public/sounds/bgm-breath-on-the-glass.mp3; audio.ts gained loadBgm()/setBgm(on, vol) — looped BufferSource → lowpass 9k → gain 0.16 ("background" level), starts once on first 'playing' (AudioSync subscribe), random start offset.
+- Rover engine fix ("sound is not there"): the NASA Perseverance drive sample WAS loading but was too quiet + over-filtered. Boosted applyRoverReal gain 0.16+0.55t → 0.3+0.6t, lowpass 650+2400t → 1400+2600t. Verified engineReal=true while driving.
+- Downloaded REAL machinery sounds from the internet (OpenGameArt, CC0/CC-BY 3.0; Wikimedia was 429-rate-limited, archive.org unreachable): generator loop, steam boiler (hydraulics), steamboat engine (pump), electronic device (servo), air compressor, fan (ventilation) — loudness-normalized, faded, mono 22 kHz MP3 (448 KB total) → public/sounds/machinery/{generator,pump,compressor,ventilation,hydraulics,servo}.mp3 + CREDITS.txt + re-runnable tools/fetch-sounds.sh.
+- audio.ts playMachinery(vol): random clip, random offset/duration 6-15 s, random StereoPanner ±0.8, random lowpass 2.4-5.6 kHz, slow fade in/out; loadMachinery() fetch+decode on init. AudioSync schedules one every 9-27 s while playing outside.
+- Atmosphere: PlanetHaze (FogExp2 — moon #0b0b0d @0.0048, mars #4a311f @0.011), DustDevil (wandering particle vortex, re-seeds 25-150 m from player, ~26 particles/s swirl), base wind lowered 0.35 → 0.22 so BGM/machinery carry the ambience.
+- Debug helpers: audio.bgmStatus()/roverRealActive()/machineryCount() for browser probes.
+- Verified in browser (agent-browser, ?debug=1): fresh load → menu → landing → skip → playing; bgm playing:true @0.16; machineryCount 6/6 decoded; auto machinery fired (monkey-patched counter); board via E (needs pointer lock), wheel spin 0→0.51 rad during 1.8 s drive, engineReal=true, steering 0.33 rad while driving, E exits and stays exited (guard), player placed beside rover, wheels freeze. Lint clean; tsc clean for src/+tools/ (also fixed pre-existing soil.ts ImageData + rover-convert NodeN type errors); console shows no runtime errors (only pre-existing THREE deprecation warnings; "1 Issue" dev badge = warning counter, dev-only).
+- Note: an apparent tab "hang" during verification was stale HMR state from editing files mid-session; a fresh reload runs stable (100 s+ soak with polling, machinery firing, no errors).
+
+Stage Summary:
+- Rover now matches the user's model's own reference render (white Curiosity); wheels only move while driving; breathing loop removed; user's mp3 is the quiet looping background music; NASA drive recording audibly powers the rover; 6 real internet-sourced machinery clips play at random intervals; planet haze + dust devil + softened wind complete the ambience. The BlueMoon FBX is confirmed as the lander model for the next task (thread C).
