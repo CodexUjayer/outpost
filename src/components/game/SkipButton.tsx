@@ -11,9 +11,9 @@ import { useGame } from '@/game/store'
 export default function SkipButton() {
   const g = useGame()
   const construction = g.construction !== null
-  const landing = g.screen === 'landing'
-  const cutscene = g.screen === 'cutscene'
-  if (!construction && !landing && !cutscene) return null
+  const cinematic =
+    g.screen === 'landing' || g.screen === 'trailer' || g.screen === 'cutscene'
+  if (!construction && !cinematic) return null
 
   const onSkip = () => {
     if (construction) g.skipConstruction()

@@ -106,15 +106,19 @@ export default function Player() {
     return () => document.removeEventListener('mousemove', onMove)
   }, [])
 
-  // reset spawn on first activation per game
+  // reset spawn on first activation per game — the player wakes up INSIDE the
+  // Intrepid's habitat deck (airlock), not out on the regolith
   useEffect(() => {
     const unsub = useGame.subscribe((s, prev) => {
-      if (s.screen === 'playing' && (prev.screen === 'landing' || prev.screen === 'cutscene')) {
-        fpState.pos.set(4, heightAt(4, 13) + EYE, 13)
-        fpState.yaw = 0.3 // face the lander
-        fpState.pitch = -0.02
-        fpState.vel.set(0, 0, 0)
+      if (
+        s.screen === 'playing' &&
+        (prev.screen === 'landing' || prev.screen === 'trailer' || prev.screen === 'cutscene')
+      ) {
+        // requesting inside='ship' makes the boarding teleport below
+        // materialize us at the airlock anchor with the airlock sound
+        if (!s.inside) useGame.setState({ inside: 'ship' })
         prevInside.current = null
+        fpState.vel.set(0, 0, 0)
       }
     })
     return unsub
@@ -133,8 +137,10 @@ export default function Player() {
     // ---------- spawn init ----------
     if (!initialized.current && st.screen === 'playing') {
       initialized.current = true
-      fpState.pos.set(4, heightAt(4, 13) + EYE, 13)
-      fpState.yaw = 0.3
+      // wake up INSIDE the ship — the boarding teleport (prevInside watcher)
+      // materializes us at the airlock anchor, facing into the habitat deck
+      if (!st.inside) useGame.setState({ inside: 'ship' })
+      prevInside.current = null
     }
     if (st.screen !== 'playing') {
       if (st.screen === 'landing' || st.construction) {

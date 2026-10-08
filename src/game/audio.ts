@@ -101,6 +101,14 @@ export class AudioEngine {
   private bgmOn = false
   private bgmVol = 0.16
   private bgmReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
+
+  // landing cinematic voice track — the user-supplied "cutscene audio" mp3
+  // (mission-control chatter) played LOUD over the descent
+  private chatBuf: AudioBuffer | null = null
+  private chatTried = false
+  private chatOn = false
+  private chatVol = 0.95
+  private chatReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
   // real recorded machinery/industrial one-shots (colony ambience)
   private machBufs: AudioBuffer[] = []
   private machTried = false
@@ -174,6 +182,7 @@ export class AudioEngine {
       this.loadRoverSample()
       this.loadBgm()
       this.loadMachinery()
+      this.loadCutsceneChatter() // warm the landing voice track early
       this.apPlanet = null // force timbre application
       this.applyAmbience()
       if (this.heartGain) {
@@ -510,6 +519,78 @@ export class AudioEngine {
       .catch(() => {
         // sample unavailable — silent background
       })
+  }
+
+  // --------------------------------------------------------------
+  // Landing cinematic voice track — the user-supplied mission-control
+  // chatter ("cutscene audio"), played LOUD over the powered descent.
+  // One-shot from t=0; stopped/faded when the cinematic ends.
+  // --------------------------------------------------------------
+  setCutsceneChatter(on: boolean, volume = 0.95): void {
+    this.chatOn = !!on
+    this.chatVol = clamp01(num(volume, 0.95))
+    if (!this.ready) return
+    const ctx = this.ctx
+    if (!ctx || !this.master) return
+    if (!this.chatBuf && !this.chatTried) this.loadCutsceneChatter()
+    if (!on) {
+      if (this.chatReal) {
+        const r = this.chatReal
+        this.chatReal = null
+        try {
+          r.gain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.25)
+          r.src.stop(ctx.currentTime + 1.1)
+        } catch {
+          /* ignore */
+        }
+      }
+      return
+    }
+    if (!this.chatBuf || this.chatReal) return
+    try {
+      const src = ctx.createBufferSource()
+      src.buffer = this.chatBuf
+      // keep voices crisp: cut the sub-bass the engine plume occupies
+      const hp = ctx.createBiquadFilter()
+      hp.type = 'highpass'
+      hp.frequency.value = 190
+      const gain = ctx.createGain()
+      gain.gain.value = 0.0001
+      src.connect(hp)
+      hp.connect(gain)
+      gain.connect(this.master)
+      src.start(0)
+      this.chatReal = { src, gain }
+      gain.gain.setTargetAtTime(this.chatVol, ctx.currentTime, 0.5)
+      src.onended = () => {
+        if (this.chatReal && this.chatReal.src === src) this.chatReal = null
+        try { hp.disconnect() } catch { /* ignore */ }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private loadCutsceneChatter(): void {
+    if (this.chatTried) return
+    if (typeof window === 'undefined' || typeof fetch === 'undefined') return
+    const ctx = this.ctx
+    if (!ctx) return
+    this.chatTried = true
+    fetch('/sounds/cutscene-chatter.mp3')
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+      .then((ab) => ctx.decodeAudioData(ab))
+      .then((buf) => {
+        this.chatBuf = buf
+        if (this.chatOn && this.ready) this.setCutsceneChatter(true, this.chatVol)
+      })
+      .catch(() => {
+        // sample unavailable — the cinematic still runs with procedural audio
+      })
+  }
+
+  chatterStatus(): { on: boolean; hasBuf: boolean; playing: boolean; vol: number } {
+    return { on: this.chatOn, hasBuf: !!this.chatBuf, playing: !!this.chatReal, vol: this.chatVol }
   }
 
   // --------------------------------------------------------------

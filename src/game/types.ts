@@ -4,7 +4,7 @@
 
 export type Planet = 'moon' | 'mars'
 
-export type Screen = 'menu' | 'landing' | 'cutscene' | 'playing' | 'gameover' | 'victory'
+export type Screen = 'menu' | 'landing' | 'trailer' | 'cutscene' | 'playing' | 'gameover' | 'victory'
 
 export type BuildingType =
   | 'solar'

@@ -36,8 +36,8 @@ function SimDriver() {
     if (st.screen === 'playing' || st.screen === 'landing') {
       st.tick(dt)
     }
-    // hold-F skip for cinematics (landing, construction, mission film)
-    if (input.down('KeyF') && (st.construction || st.screen === 'landing' || st.screen === 'cutscene')) {
+    // hold-F skip for cinematics (landing, title sequence, mission film)
+    if (input.down('KeyF') && (st.construction || st.screen === 'landing' || st.screen === 'trailer' || st.screen === 'cutscene')) {
       fHold.current += dt
       if (fHold.current > 0.7) {
         fHold.current = -1.5
@@ -92,8 +92,8 @@ function AudioSync() {
       envT.current = 0.25
       const dustStorm = st.activeEvents.some((e) => e.type === 'dust_storm')
       const storm = st.radiation.storm || dustStorm
-      // during the mission film the game audio is ducked to room tone
-      const cutscene = st.screen === 'cutscene'
+      // during the title sequence / mission film the game audio is ducked to room tone
+      const cutscene = st.screen === 'cutscene' || st.screen === 'trailer'
       audio.setEnvironment({
         inside: st.inside !== null || cutscene,
         planet: st.planet,

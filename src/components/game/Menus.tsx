@@ -297,7 +297,7 @@ function VictoryScreen() {
 export default function Menus() {
   const g = useGame()
 
-  if (g.screen === 'landing' || g.screen === 'cutscene') return null
+  if (g.screen === 'landing' || g.screen === 'trailer' || g.screen === 'cutscene') return null
   if (g.screen === 'playing') return g.paused ? <PauseOverlay /> : null
   if (g.screen === 'gameover') return <GameOverScreen />
   if (g.screen === 'victory') return <VictoryScreen />

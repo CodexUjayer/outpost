@@ -83,18 +83,16 @@ export default function VideoCutscene() {
       role="dialog"
       aria-label="Mission film playback"
     >
-      {/* the film — object-contain: true aspect ratio, cinematic letterboxing */}
+      {/* the film — object-cover: always fills the screen edge-to-edge
+          (center-cropped, never pillarboxed) */}
       <video
         ref={videoRef}
         src={VIDEO_URL}
-        className="absolute inset-0 h-full w-full object-contain"
+        className="absolute inset-0 h-full w-full object-cover"
         playsInline
         preload="auto"
       />
 
-      {/* cinematic letterbox (inset bars over contain-pillars) */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-[6vh] bg-black" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[6vh] bg-black" />
       {/* subtle vignette */}
       <div
         className="pointer-events-none absolute inset-0"

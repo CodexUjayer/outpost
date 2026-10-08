@@ -13,6 +13,8 @@ import ColonyPanel from './ColonyPanel'
 import Menus from './Menus'
 import SkipButton from './SkipButton'
 import VideoCutscene, { VideoPreload } from './VideoCutscene'
+import IntrepidTrailer, { IntrepidTrailerOverlay } from './IntrepidTrailer'
+import { LandingFadeOverlay } from './Landing'
 import ZoneFade from './ZoneFade'
 
 function HelmetOverlay() {
@@ -124,7 +126,7 @@ export default function GameRoot() {
       if (s.construction && !prev.construction && document.pointerLockElement) {
         document.exitPointerLock()
       }
-      if ((s.screen === 'landing' || s.screen === 'cutscene') && document.pointerLockElement) {
+      if ((s.screen === 'landing' || s.screen === 'trailer' || s.screen === 'cutscene') && document.pointerLockElement) {
         document.exitPointerLock()
       }
     })
@@ -160,7 +162,10 @@ export default function GameRoot() {
     >
       <Canvas
         shadows
-        dpr={[1, 1.75]}
+        dpr={[1, 1.5]}
+        // pause the whole 3D render loop while the mission film (video) plays —
+        // the decoder gets the full GPU/CPU budget, killing the old stutter
+        frameloop={screen === 'cutscene' ? 'never' : 'always'}
         camera={{ fov: 75, near: 0.08, far: 1600, position: [30, 8, 40] }}
         gl={{ antialias: true, powerPreference: 'high-performance' }}
         onCreated={({ gl }) => {
@@ -169,6 +174,10 @@ export default function GameRoot() {
         }}
       >
         <Scene />
+        {/* the built-in title sequence drives the camera — must live INSIDE the
+            Canvas (useFrame/useThree); its DOM title cards render as a sibling
+            overlay below */}
+        {screen === 'trailer' && <IntrepidTrailer />}
       </Canvas>
       <HelmetOverlay />
       <HUD />
@@ -177,6 +186,8 @@ export default function GameRoot() {
       <Menus />
       <SkipButton />
       <ClickHint />
+      {screen === 'trailer' && <IntrepidTrailerOverlay />}
+      {screen === 'landing' && <LandingFadeOverlay />}
       {screen === 'cutscene' && <VideoCutscene />}
       <ZoneFade />
       <VideoPreload />
