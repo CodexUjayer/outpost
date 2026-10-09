@@ -43,9 +43,12 @@ export const SHIP_DECK_MAX = new THREE.Vector3(8.6, 3.6, 11.2)
 
 /** glTF-local interaction anchors (converted from Blender in the export step). */
 export const SHIP_ANCHORS = {
-  // south end of the main hall, just inside the round bulkhead (the sealed
-  // round module south of it is the visual airlock pod)
-  spawn: new THREE.Vector3(0, 0.1, 3.0), // facing north (into the ship)
+  // inside the south round airlock module, a step north of its center — the
+  // module floor is the ~0.1 deck level this y matches (the old z=3 anchor sat
+  // on the 0.96 raised hall walkway, burying the player inside the slab and
+  // wedged against bulkhead geometry). Faces north: inner hatch ahead, main
+  // hall and ops console beyond — "you boarded, the ship is in front of you".
+  spawn: new THREE.Vector3(0, 0.1, 7.0), // facing north (into the ship)
   exit: new THREE.Vector3(0, 2.3, 3.85), // raised: visible from the walkway above
   opsConsole: new THREE.Vector3(0, 1.05, -5.35),
   cryoBay: new THREE.Vector3(-5.0, 1.3, 1.5),
@@ -215,4 +218,10 @@ export function debugProbe(x: number, y: number, z: number): unknown {
 
 if (typeof window !== 'undefined') {
   ;(window as unknown as { __shipProbe?: unknown }).__shipProbe = (x: number, y: number, z: number) => debugProbe(x, y, z)
+  // ?debug=1 companion probe: deck floor height under a grid point (used to
+  // map the walkable layout when authoring anchors)
+  ;(window as unknown as { __shipFloor?: unknown }).__shipFloor = (x: number, z: number) => {
+    const y = shipFloorAt(SHIP_ZONE.x + x, SHIP_ZONE.y + 1.6, SHIP_ZONE.z + z)
+    return +(y - SHIP_ZONE.y).toFixed(2)
+  }
 }

@@ -103,11 +103,12 @@ export class AudioEngine {
   private bgmReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
 
   // landing cinematic voice track — the user-supplied "cutscene audio" mp3
-  // (mission-control chatter) played LOUD over the descent
+  // (mission-control chatter). Mixed WAY above the engine/ship sounds per the
+  // user's request — the chatter is the hero of the landing audio.
   private chatBuf: AudioBuffer | null = null
   private chatTried = false
   private chatOn = false
-  private chatVol = 0.95
+  private chatVol = 1.5
   private chatReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
   // real recorded machinery/industrial one-shots (colony ambience)
   private machBufs: AudioBuffer[] = []
@@ -523,12 +524,13 @@ export class AudioEngine {
 
   // --------------------------------------------------------------
   // Landing cinematic voice track — the user-supplied mission-control
-  // chatter ("cutscene audio"), played LOUD over the powered descent.
-  // One-shot from t=0; stopped/faded when the cinematic ends.
+  // chatter ("cutscene audio"), mixed well above the powered-descent
+  // engine rumble. One-shot from t=0; stopped/faded when the cinematic ends.
   // --------------------------------------------------------------
-  setCutsceneChatter(on: boolean, volume = 0.95): void {
+  setCutsceneChatter(on: boolean, volume = 1.5): void {
     this.chatOn = !!on
-    this.chatVol = clamp01(num(volume, 0.95))
+    // allow hot levels (up to 2.0) — the master compressor tames peaks
+    this.chatVol = Math.max(0, Math.min(2, num(volume, 1.5)))
     if (!this.ready) return
     const ctx = this.ctx
     if (!ctx || !this.master) return
@@ -550,10 +552,11 @@ export class AudioEngine {
     try {
       const src = ctx.createBufferSource()
       src.buffer = this.chatBuf
-      // keep voices crisp: cut the sub-bass the engine plume occupies
+      // keep voices full: cut only the sub-bass the engine rumble occupies
+      // (lowered from 190Hz — a hotter, warmer voice level)
       const hp = ctx.createBiquadFilter()
       hp.type = 'highpass'
-      hp.frequency.value = 190
+      hp.frequency.value = 150
       const gain = ctx.createGain()
       gain.gain.value = 0.0001
       src.connect(hp)
@@ -561,7 +564,7 @@ export class AudioEngine {
       gain.connect(this.master)
       src.start(0)
       this.chatReal = { src, gain }
-      gain.gain.setTargetAtTime(this.chatVol, ctx.currentTime, 0.5)
+      gain.gain.setTargetAtTime(this.chatVol, ctx.currentTime, 0.4)
       src.onended = () => {
         if (this.chatReal && this.chatReal.src === src) this.chatReal = null
         try { hp.disconnect() } catch { /* ignore */ }
@@ -712,7 +715,9 @@ export class AudioEngine {
     const loop = this.ensureLoop('burn', null, (out) => this.buildBurn(out))
     if (!loop) return
     try {
-      loop.ctrl.gain.setTargetAtTime(0.55, ctx.currentTime, 0.45)
+      // tucked UNDER the mission-control chatter — the user wants the chatter
+      // mp3 clearly dominant over the ship/engine sound
+      loop.ctrl.gain.setTargetAtTime(0.26, ctx.currentTime, 0.45)
     } catch {
       /* ignore */
     }
@@ -945,62 +950,10 @@ export class AudioEngine {
     })
   }
 
-  radioVoice(duration = 1.8): void {
-    this.guard((ctx, master) => {
-      const dur = Math.max(0.4, Math.min(4, num(duration, 1.8)))
-      const t0 = ctx.currentTime + 0.05
-      const end = t0 + dur
-      // carrier: bandpassed noise with slow filter wobble
-      const src = this.noise(true, 'white')
-      const bp = this.bq('bandpass', 1750, 1.7)
-      const wob = this.osc('sine', 0.5)
-      const wd = this.gn(260)
-      wob.connect(wd)
-      wd.connect(bp.frequency)
-      // syllable envelope on this gain (gates both noise + babble)
-      const sg = this.gn(0.0001)
-      src.connect(bp)
-      bp.connect(sg)
-      // voiced babble: sawtooth with random pitch steps per syllable
-      const saw = this.osc('sawtooth', 120)
-      const sbp = this.bq('bandpass', 1250, 2.2)
-      const sv = this.gn(0.16)
-      saw.connect(sbp)
-      sbp.connect(sv)
-      sv.connect(sg)
-      const vib = this.osc('sine', 5.2)
-      const vd = this.gn(3.5)
-      vib.connect(vd)
-      vd.connect(saw.frequency)
-      const out = this.gn(0.5)
-      sg.connect(out)
-      out.connect(master)
-      // schedule unintelligible syllables
-      sg.gain.setValueAtTime(0.0001, t0)
-      let t = t0 + 0.03
-      while (t < end - 0.08) {
-        const on = 0.05 + Math.random() * 0.16
-        const off = 0.02 + Math.random() * 0.11
-        sg.gain.setTargetAtTime(0.45 + Math.random() * 0.55, t, Math.min(0.03, on * 0.4))
-        sg.gain.setTargetAtTime(0.04 + Math.random() * 0.08, t + on, 0.02)
-        saw.frequency.setValueAtTime(85 + Math.random() * 95, t)
-        t += on + off
-      }
-      sg.gain.setTargetAtTime(0.0001, end - 0.05, 0.03)
-      // squelch tails
-      this.click(t0 - 0.01, 1900, 0.14)
-      this.click(end + 0.02, 2100, 0.12)
-      src.start(t0)
-      wob.start(t0)
-      saw.start(t0)
-      vib.start(t0)
-      this.trackShot(
-        [src, wob, saw, vib],
-        [src, bp, wob, wd, sg, saw, sbp, sv, vib, vd, out],
-        end + 0.25
-      )
-    })
-  }
+  // NOTE: the old procedural gibberish "radio voice" (bandpassed noise in
+  // syllable bursts — the "sho sho sho" the user heard over every radio line)
+  // was removed completely at their request. Radio lines are text + blip only;
+  // the real voice channel belongs to the mission-control chatter mp3.
 
   alarmPing(): void {
     this.guard((ctx) => {

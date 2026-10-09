@@ -1,0 +1,2002 @@
+     1→// ============================================================
+     2→// Procedural audio engine — Off-World Colony STEM Game (Task 3-a)
+     3→// 100% synthesized with Web Audio API. No files, no fetch, no assets.
+     4→//
+     5→// Design:
+     6→//  - one shared AudioContext; master chain: masterGain -> compressor -> destination
+     7→//  - two shared 2s noise buffers (white + brown) reused by every noise sound
+     8→//  - persistent ambience layers (wind / storm / room tone / fan) crossfaded
+     9→//    with setTargetAtTime — never hard switches
+    10→//  - every public method is safe to call any time (no-ops before init()),
+    11→//    cheap when called every frame (state caching + epsilon gates)
+    12→//  - one-shots capped (~24 concurrent), auto-cleanup via onended
+    13→// ============================================================
+    14→
+    15→export type AudioPosition = { x: number; y: number; z: number }
+    16→export type SurfaceType = 'regolith' | 'metal'
+    17→export type Planet = 'moon' | 'mars'
+    18→
+    19→// ---------- tiny helpers ----------
+    20→
+    21→const clamp01 = (v: number): number => {
+    22→  if (typeof v !== 'number' || !isFinite(v)) return 0
+    23→  return v < 0 ? 0 : v > 1 ? 1 : v
+    24→}
+    25→
+    26→const num = (v: number, d: number): number =>
+    27→  typeof v === 'number' && isFinite(v) ? v : d
+    28→
+    29→interface LoopParts {
+    30→  sources: AudioScheduledSourceNode[]
+    31→  cleanup: AudioNode[]
+    32→  params: Record<string, AudioParam>
+    33→}
+    34→
+    35→interface LoopNode extends LoopParts {
+    36→  id: string
+    37→  ctrl: GainNode // fade / master control gain for the loop
+    38→  panner: PannerNode | null
+    39→}
+    40→
+    41→// real recorded machinery/industrial clips in public/sounds/machinery
+    42→// (generators, pumps, compressors, ventilation, hydraulics — downloaded
+    43→// from the internet; see tools/fetch-sounds.sh)
+    44→const MACHINERY_CLIPS = [
+    45→  'generator.mp3',
+    46→  'pump.mp3',
+    47→  'compressor.mp3',
+    48→  'ventilation.mp3',
+    49→  'hydraulics.mp3',
+    50→  'servo.mp3',
+    51→]
+    52→
+    53→// ============================================================
+    54→
+    55→export class AudioEngine {
+    56→  ready = false
+    57→
+    58→  // ---- core ----
+    59→  private ctx: AudioContext | null = null
+    60→  private master: GainNode | null = null
+    61→  private white: AudioBuffer | null = null
+    62→  private brown: AudioBuffer | null = null
+    63→  private heartGain: GainNode | null = null
+    64→  private volume = 0.9
+    65→  private doppler = false
+    66→
+    67→  // ---- ambience nodes (persistent) ----
+    68→  private windWhiteG: GainNode | null = null
+    69→  private windBrownG: GainNode | null = null
+    70→  private windFilter: BiquadFilterNode | null = null
+    71→  private windGain: GainNode | null = null
+    72→  private stormGain: GainNode | null = null
+    73→  private roomGain: GainNode | null = null
+    74→  private fanGain: GainNode | null = null
+    75→
+    76→  // ---- cached applied targets (keeps per-frame calls cheap) ----
+    77→  private apPlanet: Planet | null = null
+    78→  private apWind = -1
+    79→  private apStorm = -1
+    80→  private apRoom = -1
+    81→  private apFan = -1
+    82→  private apBreath = -1
+    83→  private apBreathRate = -1
+    84→
+    85→  // ---- desired state (survives being set before init) ----
+    86→  private env = { inside: false, planet: 'moon' as Planet, windIntensity: 0.3, storm: false }
+    87→  private fanLevel = 0.4
+    88→  private breathOn = false
+    89→  private breathEffort = 0.4
+    90→  private heartLevel = 0
+    91→  private alarmOn = false
+    92→  private roverOn = false
+    93→  private roverThrottle = 0
+    94→  // real recorded rover audio (NASA/JPL Perseverance drive — Sol 16)
+    95→  private roverBuf: AudioBuffer | null = null
+    96→  private roverBufTried = false
+    97→  private roverReal: { src: AudioBufferSourceNode; gain: GainNode; filter: BiquadFilterNode } | null = null
+    98→  // background music — user-supplied ambient track, looped quietly
+    99→  private bgmBuf: AudioBuffer | null = null
+   100→  private bgmTried = false
+   101→  private bgmOn = false
+   102→  private bgmVol = 0.16
+   103→  private bgmReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
+   104→
+   105→  // landing cinematic voice track — the user-supplied "cutscene audio" mp3
+   106→  // (mission-control chatter) played LOUD over the descent
+   107→  private chatBuf: AudioBuffer | null = null
+   108→  private chatTried = false
+   109→  private chatOn = false
+   110→  private chatVol = 0.95
+   111→  private chatReal: { src: AudioBufferSourceNode; gain: GainNode } | null = null
+   112→  // real recorded machinery/industrial one-shots (colony ambience)
+   113→  private machBufs: AudioBuffer[] = []
+   114→  private machTried = false
+   115→  private motorOn = false
+   116→  private motorThrottle = 0
+   117→  private burnOn = false
+   118→
+   119→  // ---- scheduler (alarm beeps + heartbeat, single timer) ----
+   120→  private schedTimer: ReturnType<typeof setInterval> | null = null
+   121→  private nextAlarmAt = 0
+   122→  private alarmHi = false
+   123→  private nextHeartAt = 0
+   124→
+   125→  // ---- loops & one-shot budget ----
+   126→  private loops = new Map<string, LoopNode>()
+   127→  private loopCounter = 0
+   128→  private shots = 0
+   129→  private readonly SHOT_CAP = 24
+   130→
+   131→  // ---- listener cache (default placement for new positional loops) ----
+   132→  private listenerPos: AudioPosition = { x: 0, y: 1.6, z: 0 }
+   133→  private listenerFwd: AudioPosition = { x: 0, y: 0, z: -1 }
+   134→
+   135→  // ================================================================
+   136→  // Lifecycle
+   137→  // ================================================================
+   138→
+   139→  init(): void {
+   140→    if (this.ready) {
+   141→      this.resume()
+   142→      return
+   143→    }
+   144→    if (typeof window === 'undefined') return
+   145→    try {
+   146→      const w = window as unknown as {
+   147→        AudioContext?: typeof AudioContext
+   148→        webkitAudioContext?: typeof AudioContext
+   149→      }
+   150→      const Ctor = w.AudioContext ?? w.webkitAudioContext
+   151→      if (!Ctor) return
+   152→
+   153→      const ctx = new Ctor()
+   154→      this.ctx = ctx
+   155→
+   156→      // shared noise buffers (2s each)
+   157→      this.white = this.makeNoiseBuffer('white')
+   158→      this.brown = this.makeNoiseBuffer('brown')
+   159→
+   160→      // master chain: gain -> compressor -> destination
+   161→      const master = ctx.createGain()
+   162→      master.gain.value = clamp01(this.volume)
+   163→      const comp = ctx.createDynamicsCompressor()
+   164→      comp.threshold.value = -16
+   165→      comp.knee.value = 18
+   166→      comp.ratio.value = 5
+   167→      comp.attack.value = 0.004
+   168→      comp.release.value = 0.24
+   169→      master.connect(comp)
+   170→      comp.connect(ctx.destination)
+   171→      this.master = master
+   172→
+   173→      // heartbeat bus
+   174→      const hg = ctx.createGain()
+   175→      hg.gain.value = 0
+   176→      hg.connect(master)
+   177→      this.heartGain = hg
+   178→
+   179→      this.buildAmbience()
+   180→
+   181→      this.ready = true
+   182→      this.loadRoverSample()
+   183→      this.loadBgm()
+   184→      this.loadMachinery()
+   185→      this.loadCutsceneChatter() // warm the landing voice track early
+   186→      this.apPlanet = null // force timbre application
+   187→      this.applyAmbience()
+   188→      if (this.heartGain) {
+   189→        this.heartGain.gain.setTargetAtTime(clamp01(this.heartLevel) * 0.35, ctx.currentTime, 0.3)
+   190→      }
+   191→      // re-apply any loop state requested before init
+   192→      if (this.burnOn) {
+   193→        this.burnOn = false
+   194→        this.landingBurn(true)
+   195→      }
+   196→      if (this.roverOn) {
+   197→        const th = this.roverThrottle
+   198→        this.roverOn = false
+   199→        this.setRoverEngine(true, th)
+   200→      }
+   201→      if (this.motorOn) {
+   202→        const th = this.motorThrottle
+   203→        this.motorOn = false
+   204→        this.setConstructionMotor(true, th)
+   205→      }
+   206→
+   207→      if (ctx.state === 'suspended') ctx.resume().catch(() => {})
+   208→      if (!this.schedTimer) {
+   209→        this.schedTimer = setInterval(() => this.schedTick(), 200)
+   210→      }
+   211→    } catch {
+   212→      // never leave a half-built engine marked ready
+   213→      this.ctx = null
+   214→      this.master = null
+   215→      this.ready = false
+   216→    }
+   217→  }
+   218→
+   219→  resume(): void {
+   220→    const ctx = this.ctx
+   221→    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {})
+   222→  }
+   223→
+   224→  suspend(): void {
+   225→    const ctx = this.ctx
+   226→    if (ctx && ctx.state === 'running') ctx.suspend().catch(() => {})
+   227→  }
+   228→
+   229→  setMasterVolume(v: number): void {
+   230→    const vol = clamp01(v)
+   231→    this.volume = vol
+   232→    if (!this.ready || !this.master || !this.ctx) return
+   233→    try {
+   234→      this.master.gain.setTargetAtTime(vol, this.ctx.currentTime, 0.05)
+   235→    } catch {
+   236→      /* ignore */
+   237→    }
+   238→  }
+   239→
+   240→  setDoppler(on: boolean): void {
+   241→    this.doppler = !!on
+   242→  }
+   243→
+   244→  setListener(pos: AudioPosition, forward: { x: number; y: number; z: number }): void {
+   245→    const p = pos ?? { x: 0, y: 1.6, z: 0 }
+   246→    this.listenerPos = { x: num(p.x, 0), y: num(p.y, 1.6), z: num(p.z, 0) }
+   247→    const f = forward ?? { x: 0, y: 0, z: -1 }
+   248→    let fx = num(f.x, 0)
+   249→    let fy = num(f.y, 0)
+   250→    let fz = num(f.z, -1)
+   251→    const m = Math.max(Math.abs(fx), Math.abs(fy), Math.abs(fz))
+   252→    if (m < 1e-6) {
+   253→      fx = 0
+   254→      fy = 0
+   255→      fz = -1
+   256→    } else {
+   257→      fx /= m
+   258→      fy /= m
+   259→      fz /= m
+   260→    }
+   261→    this.listenerFwd = { x: fx, y: fy, z: fz }
+   262→
+   263→    const ctx = this.ctx
+   264→    if (!ctx || !this.ready) return
+   265→    try {
+   266→      const L = ctx.listener
+   267→      const lp = this.listenerPos
+   268→      if (L.positionX) {
+   269→        L.positionX.value = lp.x
+   270→        L.positionY.value = lp.y
+   271→        L.positionZ.value = lp.z
+   272→      } else {
+   273→        L.setPosition(lp.x, lp.y, lp.z)
+   274→      }
+   275→      if (L.forwardX) {
+   276→        L.forwardX.value = fx
+   277→        L.forwardY.value = fy
+   278→        L.forwardZ.value = fz
+   279→      } else {
+   280→        L.setOrientation(fx, fy, fz, 0, 1, 0)
+   281→      }
+   282→    } catch {
+   283→      /* ignore */
+   284→    }
+   285→  }
+   286→
+   287→  // ================================================================
+   288→  // Ambience
+   289→  // ================================================================
+   290→
+   291→  setEnvironment(opts: {
+   292→    inside: boolean
+   293→    planet: Planet
+   294→    windIntensity: number
+   295→    storm: boolean
+   296→  }): void {
+   297→    if (!opts) return
+   298→    this.env = {
+   299→      inside: !!opts.inside,
+   300→      planet: opts.planet === 'mars' ? 'mars' : 'moon',
+   301→      windIntensity: clamp01(num(opts.windIntensity, 0.3)),
+   302→      storm: !!opts.storm,
+   303→    }
+   304→    if (!this.ready) return
+   305→    this.applyAmbience()
+   306→  }
+   307→
+   308→  setFan(intensity: number): void {
+   309→    const lvl = clamp01(num(intensity, 0.4))
+   310→    if (Math.abs(lvl - this.fanLevel) < 0.01) return
+   311→    this.fanLevel = lvl
+   312→    if (!this.ready) return
+   313→    this.applyAmbience()
+   314→  }
+   315→
+   316→  setAlarm(on: boolean): void {
+   317→    const next = !!on
+   318→    if (next === this.alarmOn) return
+   319→    this.alarmOn = next
+   320→    if (!this.ready) return
+   321→    const ctx = this.ctx
+   322→    if (!ctx || ctx.state !== 'running') return
+   323→    if (next) {
+   324→      // immediate first beep, then the scheduler keeps the pattern going
+   325→      this.alarmBeep(ctx.currentTime + 0.08, this.alarmHi ? 880 : 660)
+   326→      this.alarmHi = !this.alarmHi
+   327→      this.nextAlarmAt = ctx.currentTime + 1.2
+   328→    }
+   329→  }
+   330→
+   331→  setBreathing(on: boolean, effort = 0.4): void {
+   332→    const e = clamp01(num(effort, 0.4))
+   333→    if (on === this.breathOn && Math.abs(e - this.breathEffort) < 0.02) return
+   334→    this.breathOn = !!on
+   335→    this.breathEffort = e
+   336→    if (!this.ready) return
+   337→    this.applyBreathing()
+   338→  }
+   339→
+   340→  setHeartbeat(intensity = 0): void {
+   341→    const lvl = clamp01(num(intensity, 0))
+   342→    const wasOff = this.heartLevel <= 0.02
+   343→    const changed = Math.abs(lvl - this.heartLevel) > 0.015
+   344→    this.heartLevel = lvl
+   345→    if (!this.ready) return
+   346→    const ctx = this.ctx
+   347→    if (!ctx || !this.heartGain) return
+   348→    if (changed) {
+   349→      try {
+   350→        this.heartGain.gain.setTargetAtTime(lvl * 0.35, ctx.currentTime, 0.4)
+   351→      } catch {
+   352→        /* ignore */
+   353→      }
+   354→    }
+   355→    if (wasOff && lvl > 0.02) this.nextHeartAt = 0
+   356→  }
+   357→
+   358→  setRoverEngine(on: boolean, throttle = 0): void {
+   359→    const th = clamp01(num(throttle, 0))
+   360→    const changed = on !== this.roverOn || Math.abs(th - this.roverThrottle) >= 0.015
+   361→    this.roverOn = !!on
+   362→    this.roverThrottle = th
+   363→    if (!this.ready) return
+   364→    const ctx = this.ctx
+   365→    if (!ctx) return
+   366→    // prefer the real recorded rover audio once it has decoded
+   367→    if (!this.roverBuf && !this.roverBufTried) this.loadRoverSample()
+   368→    if (this.roverBuf) {
+   369→      if (!changed && (on ? this.roverReal !== null : this.roverReal === null)) return
+   370→      this.applyRoverReal(on, th)
+   371→      return
+   372→    }
+   373→    if (!on) {
+   374→      if (changed) this.killLoop('rover', 0.35)
+   375→      return
+   376→    }
+   377→    if (!changed && this.loops.has('rover')) return
+   378→    const loop = this.ensureLoop('rover', null, (out) => this.buildRover(out))
+   379→    if (!loop) return
+   380→    const t = ctx.currentTime
+   381→    const f = 74 + th * 92
+   382→    try {
+   383→      loop.params.freq.setTargetAtTime(f, t, 0.15)
+   384→      loop.params.sub.setTargetAtTime(f / 2, t, 0.15)
+   385→      loop.params.lp.setTargetAtTime(340 + th * 1200, t, 0.2)
+   386→      loop.params.eng.setTargetAtTime(0.045 + th * 0.1, t, 0.18)
+   387→      loop.params.wheel.setTargetAtTime(th > 0.02 ? th * 0.11 : 0.0001, t, 0.25)
+   388→      loop.ctrl.gain.setTargetAtTime(1, t, 0.2)
+   389→    } catch {
+   390→      /* ignore */
+   391→    }
+   392→  }
+   393→
+   394→  // --------------------------------------------------------------
+   395→  // Real recorded rover audio (public NASA/JPL Perseverance drive
+   396→  // recording, Sol 16 — wheels + motors on Mars regolith).
+   397→  // --------------------------------------------------------------
+   398→  private loadRoverSample(): void {
+   399→    if (this.roverBufTried) return
+   400→    if (typeof window === 'undefined' || typeof fetch === 'undefined') return
+   401→    const ctx = this.ctx
+   402→    if (!ctx) return
+   403→    this.roverBufTried = true
+   404→    fetch('/sounds/rover-drive.mp3')
+   405→      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+   406→      .then((ab) => ctx.decodeAudioData(ab))
+   407→      .then((buf) => {
+   408→        this.roverBuf = buf
+   409→        if (this.roverOn && this.ready) this.setRoverEngine(true, this.roverThrottle)
+   410→      })
+   411→      .catch(() => {
+   412→        // sample unavailable — procedural engine keeps running
+   413→      })
+   414→  }
+   415→
+   416→  private applyRoverReal(on: boolean, th: number): void {
+   417→    const ctx = this.ctx
+   418→    const master = this.master
+   419→    if (!ctx || !master) return
+   420→    const t = ctx.currentTime
+   421→    if (this.loops.has('rover')) this.killLoop('rover', 0.2) // replace procedural fallback
+   422→    if (!on) {
+   423→      const r = this.roverReal
+   424→      this.roverReal = null
+   425→      if (r) {
+   426→        try {
+   427→          r.gain.gain.setTargetAtTime(0.0001, t, 0.12)
+   428→          r.src.stop(t + 0.6)
+   429→        } catch {
+   430→          /* ignore */
+   431→        }
+   432→      }
+   433→      return
+   434→    }
+   435→    let r = this.roverReal
+   436→    if (!r) {
+   437→      try {
+   438→        const src = ctx.createBufferSource()
+   439→        src.buffer = this.roverBuf!
+   440→        src.loop = true
+   441→        const filter = ctx.createBiquadFilter()
+   442→        filter.type = 'lowpass'
+   443→        filter.frequency.value = 1200
+   444→        filter.Q.value = 0.4
+   445→        const gain = ctx.createGain()
+   446→        gain.gain.value = 0.0001
+   447→        src.connect(filter)
+   448→        filter.connect(gain)
+   449→        gain.connect(master)
+   450→        const dur = this.roverBuf?.duration ?? 1
+   451→        src.start(0, Math.random() * Math.max(0.1, dur - 2))
+   452→        r = this.roverReal = { src, gain, filter }
+   453→      } catch {
+   454→        return
+   455→      }
+   456→    }
+   457→    try {
+   458→      r.gain.gain.setTargetAtTime(0.3 + th * 0.6, t, 0.15)
+   459→      r.filter.frequency.setTargetAtTime(1400 + th * 2600, t, 0.2)
+   460→      r.src.playbackRate.setTargetAtTime(0.82 + th * 0.4, t, 0.2)
+   461→    } catch {
+   462→      /* ignore */
+   463→    }
+   464→  }
+   465→
+   466→  // --------------------------------------------------------------
+   467→  // Background music — user-supplied ambient track (Breath on the
+   468→  // Glass), looped quietly like an environmental sound bed.
+   469→  // --------------------------------------------------------------
+   470→  setBgm(on: boolean, volume = 0.16): void {
+   471→    this.bgmOn = !!on
+   472→    this.bgmVol = clamp01(num(volume, 0.16))
+   473→    if (!this.ready) return
+   474→    const ctx = this.ctx
+   475→    if (!ctx || !this.master) return
+   476→    if (!this.bgmBuf && !this.bgmTried) this.loadBgm()
+   477→    if (!on || !this.bgmBuf) return
+   478→    if (this.bgmReal) {
+   479→      try {
+   480→        this.bgmReal.gain.gain.setTargetAtTime(this.bgmVol, ctx.currentTime, 0.8)
+   481→      } catch {
+   482→        /* ignore */
+   483→      }
+   484→      return
+   485→    }
+   486→    try {
+   487→      const src = ctx.createBufferSource()
+   488→      src.buffer = this.bgmBuf
+   489→      src.loop = true
+   490→      const lp = ctx.createBiquadFilter()
+   491→      lp.type = 'lowpass'
+   492→      lp.frequency.value = 9000
+   493→      const gain = ctx.createGain()
+   494→      gain.gain.value = 0.0001
+   495→      src.connect(lp)
+   496→      lp.connect(gain)
+   497→      gain.connect(this.master)
+   498→      src.start(0, Math.random() * Math.max(0.1, (this.bgmBuf.duration ?? 1) - 2))
+   499→      this.bgmReal = { src, gain }
+   500→      gain.gain.setTargetAtTime(this.bgmVol, ctx.currentTime, 1.2)
+   501→    } catch {
+   502→      /* ignore */
+   503→    }
+   504→  }
+   505→
+   506→  private loadBgm(): void {
+   507→    if (this.bgmTried) return
+   508→    if (typeof window === 'undefined' || typeof fetch === 'undefined') return
+   509→    const ctx = this.ctx
+   510→    if (!ctx) return
+   511→    this.bgmTried = true
+   512→    fetch('/sounds/bgm-breath-on-the-glass.mp3')
+   513→      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+   514→      .then((ab) => ctx.decodeAudioData(ab))
+   515→      .then((buf) => {
+   516→        this.bgmBuf = buf
+   517→        if (this.bgmOn && this.ready) this.setBgm(true, this.bgmVol)
+   518→      })
+   519→      .catch(() => {
+   520→        // sample unavailable — silent background
+   521→      })
+   522→  }
+   523→
+   524→  // --------------------------------------------------------------
+   525→  // Landing cinematic voice track — the user-supplied mission-control
+   526→  // chatter ("cutscene audio"), played LOUD over the powered descent.
+   527→  // One-shot from t=0; stopped/faded when the cinematic ends.
+   528→  // --------------------------------------------------------------
+   529→  setCutsceneChatter(on: boolean, volume = 0.95): void {
+   530→    this.chatOn = !!on
+   531→    this.chatVol = clamp01(num(volume, 0.95))
+   532→    if (!this.ready) return
+   533→    const ctx = this.ctx
+   534→    if (!ctx || !this.master) return
+   535→    if (!this.chatBuf && !this.chatTried) this.loadCutsceneChatter()
+   536→    if (!on) {
+   537→      if (this.chatReal) {
+   538→        const r = this.chatReal
+   539→        this.chatReal = null
+   540→        try {
+   541→          r.gain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.25)
+   542→          r.src.stop(ctx.currentTime + 1.1)
+   543→        } catch {
+   544→          /* ignore */
+   545→        }
+   546→      }
+   547→      return
+   548→    }
+   549→    if (!this.chatBuf || this.chatReal) return
+   550→    try {
+   551→      const src = ctx.createBufferSource()
+   552→      src.buffer = this.chatBuf
+   553→      // keep voices crisp: cut the sub-bass the engine plume occupies
+   554→      const hp = ctx.createBiquadFilter()
+   555→      hp.type = 'highpass'
+   556→      hp.frequency.value = 190
+   557→      const gain = ctx.createGain()
+   558→      gain.gain.value = 0.0001
+   559→      src.connect(hp)
+   560→      hp.connect(gain)
+   561→      gain.connect(this.master)
+   562→      src.start(0)
+   563→      this.chatReal = { src, gain }
+   564→      gain.gain.setTargetAtTime(this.chatVol, ctx.currentTime, 0.5)
+   565→      src.onended = () => {
+   566→        if (this.chatReal && this.chatReal.src === src) this.chatReal = null
+   567→        try { hp.disconnect() } catch { /* ignore */ }
+   568→      }
+   569→    } catch {
+   570→      /* ignore */
+   571→    }
+   572→  }
+   573→
+   574→  private loadCutsceneChatter(): void {
+   575→    if (this.chatTried) return
+   576→    if (typeof window === 'undefined' || typeof fetch === 'undefined') return
+   577→    const ctx = this.ctx
+   578→    if (!ctx) return
+   579→    this.chatTried = true
+   580→    fetch('/sounds/cutscene-chatter.mp3')
+   581→      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+   582→      .then((ab) => ctx.decodeAudioData(ab))
+   583→      .then((buf) => {
+   584→        this.chatBuf = buf
+   585→        if (this.chatOn && this.ready) this.setCutsceneChatter(true, this.chatVol)
+   586→      })
+   587→      .catch(() => {
+   588→        // sample unavailable — the cinematic still runs with procedural audio
+   589→      })
+   590→  }
+   591→
+   592→  chatterStatus(): { on: boolean; hasBuf: boolean; playing: boolean; vol: number } {
+   593→    return { on: this.chatOn, hasBuf: !!this.chatBuf, playing: !!this.chatReal, vol: this.chatVol }
+   594→  }
+   595→
+   596→  // --------------------------------------------------------------
+   597→  // Colony machinery one-shots — real recorded industrial sounds
+   598→  // that play at random intervals around the player (generators,
+   599→  // pumps, compressors, servos working somewhere on the planet).
+   600→  // --------------------------------------------------------------
+   601→  playMachinery(volume = 0.12): void {
+   602→    const v = clamp01(num(volume, 0.12))
+   603→    const ctx = this.ctx
+   604→    if (!ctx || !this.master || this.machBufs.length === 0 || v <= 0.001) return
+   605→    if (this.shots >= this.SHOT_CAP) return
+   606→    try {
+   607→      const buf = this.machBufs[Math.floor(Math.random() * this.machBufs.length)]
+   608→      const src = ctx.createBufferSource()
+   609→      src.buffer = buf
+   610→      src.playbackRate.value = 0.85 + Math.random() * 0.3
+   611→      const lp = ctx.createBiquadFilter()
+   612→      lp.type = 'lowpass'
+   613→      lp.frequency.value = 2400 + Math.random() * 3200
+   614→      const gain = ctx.createGain()
+   615→      gain.gain.value = 0.0001
+   616→      src.connect(lp)
+   617→      lp.connect(gain)
+   618→      const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null
+   619→      let tail: AudioNode = gain
+   620→      if (pan) {
+   621→        pan.pan.value = Math.random() * 1.6 - 0.8
+   622→        gain.connect(pan)
+   623→        pan.connect(this.master)
+   624→        tail = pan
+   625→      } else {
+   626→        gain.connect(this.master)
+   627→      }
+   628→      const dur = Math.min(buf.duration ?? 8, 6 + Math.random() * 9)
+   629→      const off = Math.random() * Math.max(0.1, (buf.duration ?? 1) - dur - 0.2)
+   630→      const t = ctx.currentTime + 0.03
+   631→      gain.gain.setValueAtTime(0.0001, t)
+   632→      gain.gain.setTargetAtTime(v, t, 1.1)
+   633→      gain.gain.setTargetAtTime(0.0001, t + Math.max(0.5, dur - 1.6), 0.55)
+   634→      src.start(t, off)
+   635→      src.stop(t + dur + 0.4)
+   636→      this.shots++
+   637→      src.onended = () => {
+   638→        this.shots--
+   639→        try { tail.disconnect() } catch { /* ignore */ }
+   640→      }
+   641→    } catch {
+   642→      /* ignore */
+   643→    }
+   644→  }
+   645→
+   646→  machineryCount(): number {
+   647→    return this.machBufs.length
+   648→  }
+   649→
+   650→  // debug/verification helper (also used by browser probes)
+   651→  bgmStatus(): { on: boolean; hasBuf: boolean; playing: boolean; vol: number } {
+   652→    return { on: this.bgmOn, hasBuf: !!this.bgmBuf, playing: !!this.bgmReal, vol: this.bgmVol }
+   653→  }
+   654→
+   655→  roverRealActive(): boolean {
+   656→    return !!this.roverReal
+   657→  }
+   658→
+   659→  private loadMachinery(): void {
+   660→    if (this.machTried) return
+   661→    if (typeof window === 'undefined' || typeof fetch === 'undefined') return
+   662→    const ctx = this.ctx
+   663→    if (!ctx) return
+   664→    this.machTried = true
+   665→    for (const f of MACHINERY_CLIPS) {
+   666→      fetch(`/sounds/machinery/${f}`)
+   667→        .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+   668→        .then((ab) => ctx.decodeAudioData(ab))
+   669→        .then((buf) => { this.machBufs.push(buf) })
+   670→        .catch(() => {
+   671→          // clip unavailable — skipped
+   672→        })
+   673→    }
+   674→  }
+   675→
+   676→  setConstructionMotor(on: boolean, throttle = 0): void {
+   677→    const th = clamp01(num(throttle, 0))
+   678→    const changed = on !== this.motorOn || Math.abs(th - this.motorThrottle) >= 0.02
+   679→    this.motorOn = !!on
+   680→    this.motorThrottle = th
+   681→    if (!this.ready) return
+   682→    const ctx = this.ctx
+   683→    if (!ctx) return
+   684→    if (!on) {
+   685→      if (changed) this.killLoop('cmotor', 0.4)
+   686→      return
+   687→    }
+   688→    if (!changed && this.loops.has('cmotor')) return
+   689→    const loop = this.ensureLoop('cmotor', null, (out) => this.buildMotor(out))
+   690→    if (!loop) return
+   691→    const t = ctx.currentTime
+   692→    try {
+   693→      loop.params.servo.setTargetAtTime(520 + th * 780, t, 0.2)
+   694→      loop.params.main.setTargetAtTime(0.35 + th * 0.65, t, 0.25)
+   695→      loop.ctrl.gain.setTargetAtTime(1, t, 0.25)
+   696→    } catch {
+   697→      /* ignore */
+   698→    }
+   699→  }
+   700→
+   701→  landingBurn(on: boolean): void {
+   702→    const next = !!on
+   703→    if (next === this.burnOn) return
+   704→    this.burnOn = next
+   705→    if (!this.ready) return
+   706→    const ctx = this.ctx
+   707→    if (!ctx) return
+   708→    if (!on) {
+   709→      this.killLoop('burn', 0.7)
+   710→      return
+   711→    }
+   712→    const loop = this.ensureLoop('burn', null, (out) => this.buildBurn(out))
+   713→    if (!loop) return
+   714→    try {
+   715→      loop.ctrl.gain.setTargetAtTime(0.55, ctx.currentTime, 0.45)
+   716→    } catch {
+   717→      /* ignore */
+   718→    }
+   719→  }
+   720→
+   721→  // ================================================================
+   722→  // One-shots
+   723→  // ================================================================
+   724→
+   725→  footstep(surface: SurfaceType, volume = 1): void {
+   726→    this.guard((ctx, master) => {
+   727→      const v = clamp01(volume)
+   728→      if (v <= 0.001) return
+   729→      const t = ctx.currentTime + 0.005
+   730→      if (surface === 'metal') {
+   731→        // clang-tap: sharp filtered tap + short metallic ring
+   732→        const src = this.noise(true, 'white')
+   733→        const bp = this.bq('bandpass', 1400 + Math.random() * 800, 1.1)
+   734→        const g = this.gn(0.0001)
+   735→        src.connect(bp)
+   736→        bp.connect(g)
+   737→        g.connect(master)
+   738→        g.gain.setValueAtTime(0.0001, t)
+   739→        g.gain.linearRampToValueAtTime(0.22 * v, t + 0.004)
+   740→        g.gain.setTargetAtTime(0.0001, t + 0.006, 0.02)
+   741→        const o = this.osc('triangle', 900 + Math.random() * 600)
+   742→        const og = this.gn(0.0001)
+   743→        o.connect(og)
+   744→        og.connect(master)
+   745→        og.gain.setValueAtTime(0.0001, t + 0.003)
+   746→        og.gain.linearRampToValueAtTime(0.05 * v, t + 0.01)
+   747→        og.gain.setTargetAtTime(0.0001, t + 0.015, 0.055)
+   748→        src.start(t)
+   749→        o.start(t)
+   750→        this.trackShot([src, o], [src, bp, g, o, og], t + 0.5)
+   751→      } else {
+   752→        // regolith: muffled crunch — lowpass thump + gritty bandpass grains
+   753→        const src = this.noise(true, 'white')
+   754→        const lp = this.bq('lowpass', 380 + Math.random() * 200, 0.8)
+   755→        const g = this.gn(0.0001)
+   756→        const bp = this.bq('bandpass', 950 + Math.random() * 300, 0.8)
+   757→        const g2 = this.gn(0.0001)
+   758→        src.connect(lp)
+   759→        lp.connect(g)
+   760→        src.connect(bp)
+   761→        bp.connect(g2)
+   762→        g.connect(master)
+   763→        g2.connect(master)
+   764→        g.gain.setValueAtTime(0.0001, t)
+   765→        g.gain.linearRampToValueAtTime(0.26 * v, t + 0.008)
+   766→        g.gain.setTargetAtTime(0.0001, t + 0.012, 0.045)
+   767→        g2.gain.setValueAtTime(0.0001, t)
+   768→        g2.gain.linearRampToValueAtTime(0.09 * v, t + 0.01)
+   769→        g2.gain.setTargetAtTime(0.0001, t + 0.015, 0.03)
+   770→        // second crunch grain (boot flex / grit shift)
+   771→        g2.gain.setValueAtTime(0.06 * v, t + 0.07)
+   772→        g2.gain.setTargetAtTime(0.0001, t + 0.075, 0.025)
+   773→        src.start(t)
+   774→        this.trackShot([src], [src, lp, g, bp, g2], t + 0.45)
+   775→      }
+   776→    })
+   777→  }
+   778→
+   779→  interactBlip(): void {
+   780→    this.guard((ctx) => {
+   781→      this.tone(ctx.currentTime + 0.01, 1150, 0.09, 0.12, 'sine', 1560)
+   782→    })
+   783→  }
+   784→
+   785→  denyBlip(): void {
+   786→    this.guard((ctx) => {
+   787→      const t = ctx.currentTime + 0.01
+   788→      this.tone(t, 320, 0.08, 0.11, 'triangle', 262)
+   789→      this.tone(t + 0.11, 262, 0.1, 0.1, 'triangle', 215)
+   790→    })
+   791→  }
+   792→
+   793→  toolWrench(duration = 0.9): void {
+   794→    this.guard((ctx, master) => {
+   795→      const dur = Math.max(0.3, Math.min(4, num(duration, 0.9)))
+   796→      const t0 = ctx.currentTime + 0.02
+   797→      const n = Math.max(4, Math.min(16, Math.round(dur / 0.08)))
+   798→      // ratchet clicks as spikes on one shared noise source
+   799→      const src = this.noise(true, 'white')
+   800→      const hp = this.bq('highpass', 1400, 0.8)
+   801→      const lp = this.bq('lowpass', 6500, 0.7)
+   802→      const g = this.gn(0.0001)
+   803→      src.connect(hp)
+   804→      hp.connect(lp)
+   805→      lp.connect(g)
+   806→      g.connect(master)
+   807→      g.gain.setValueAtTime(0.0001, t0)
+   808→      let t = t0
+   809→      for (let i = 0; i < n; i++) {
+   810→        g.gain.setValueAtTime(0.13 + Math.random() * 0.1, t)
+   811→        g.gain.setTargetAtTime(0.0001, t + 0.008, 0.014)
+   812→        t += 0.05 + Math.random() * 0.1
+   813→      }
+   814→      // final stronger clack
+   815→      const tf = Math.max(t, t0 + dur)
+   816→      g.gain.setValueAtTime(0.34, tf)
+   817→      g.gain.setTargetAtTime(0.0001, tf + 0.01, 0.03)
+   818→      src.start(t0)
+   819→      this.trackShot([src], [src, hp, lp, g], tf + 0.3)
+   820→      this.thumpTick(tf, 0.18)
+   821→    })
+   822→  }
+   823→
+   824→  toolWeld(duration = 1.5): void {
+   825→    this.guard((ctx, master) => {
+   826→      const dur = Math.max(0.4, Math.min(6, num(duration, 1.5)))
+   827→      const t0 = ctx.currentTime + 0.02
+   828→      const end = t0 + dur
+   829→      // sizzling arc: highpassed white noise, sputtering envelope
+   830→      const src = this.noise(true, 'white')
+   831→      const hp = this.bq('highpass', 3000, 0.8)
+   832→      const bp = this.bq('bandpass', 6200, 1.2)
+   833→      const g = this.gn(0.0001)
+   834→      src.connect(hp)
+   835→      hp.connect(bp)
+   836→      bp.connect(g)
+   837→      g.connect(master)
+   838→      g.gain.setValueAtTime(0.0001, t0)
+   839→      g.gain.linearRampToValueAtTime(0.28, t0 + 0.04)
+   840→      let t = t0 + 0.12
+   841→      while (t < end - 0.06) {
+   842→        g.gain.setTargetAtTime(0.1 + Math.random() * 0.24, t, 0.03)
+   843→        t += 0.05 + Math.random() * 0.12
+   844→      }
+   845→      g.gain.setTargetAtTime(0.0001, end - 0.05, 0.05)
+   846→      // random arc crackles tapped off the same source
+   847→      const cg = this.gn(0.0001)
+   848→      bp.connect(cg)
+   849→      cg.connect(master)
+   850→      cg.gain.setValueAtTime(0.0001, t0)
+   851→      let ct = t0 + 0.06
+   852→      while (ct < end - 0.05) {
+   853→        cg.gain.setValueAtTime(0.12 + Math.random() * 0.2, ct)
+   854→        cg.gain.setTargetAtTime(0.0001, ct + 0.008, 0.015)
+   855→        ct += 0.06 + Math.random() * 0.18
+   856→      }
+   857→      // faint electrical hum
+   858→      const hum = this.osc('sawtooth', 118)
+   859→      const hlp = this.bq('lowpass', 240, 0.7)
+   860→      const hg = this.gn(0.0001)
+   861→      hum.connect(hlp)
+   862→      hlp.connect(hg)
+   863→      hg.connect(master)
+   864→      hg.gain.setValueAtTime(0.0001, t0)
+   865→      hg.gain.linearRampToValueAtTime(0.055, t0 + 0.08)
+   866→      hg.gain.setTargetAtTime(0.0001, end - 0.08, 0.08)
+   867→      src.start(t0)
+   868→      hum.start(t0)
+   869→      this.trackShot([src, hum], [src, hp, bp, g, cg, hum, hlp, hg], end + 0.4)
+   870→    })
+   871→  }
+   872→
+   873→  airlock(): void {
+   874→    this.guard((ctx, master) => {
+   875→      const t0 = ctx.currentTime + 0.02
+   876→      // pressure equalization: white noise burst with a lowpass sweep down
+   877→      const src = this.noise(true, 'white')
+   878→      const hp = this.bq('highpass', 320, 0.7)
+   879→      const lp = this.bq('lowpass', 7200, 0.5)
+   880→      const g = this.gn(0.0001)
+   881→      src.connect(hp)
+   882→      hp.connect(lp)
+   883→      lp.connect(g)
+   884→      g.connect(master)
+   885→      // valve snap
+   886→      g.gain.setValueAtTime(0.0001, t0)
+   887→      g.gain.linearRampToValueAtTime(0.2, t0 + 0.008)
+   888→      g.gain.setTargetAtTime(0.0001, t0 + 0.01, 0.02)
+   889→      // hiss
+   890→      const t1 = t0 + 0.14
+   891→      g.gain.setValueAtTime(0.0001, t1)
+   892→      g.gain.linearRampToValueAtTime(0.4, t1 + 0.06)
+   893→      g.gain.setValueAtTime(0.4, t1 + 0.5)
+   894→      g.gain.setTargetAtTime(0.0001, t1 + 0.55, 0.3)
+   895→      lp.frequency.setValueAtTime(7200, t1)
+   896→      lp.frequency.setTargetAtTime(800, t1 + 0.2, 0.45)
+   897→      // soft end clunk
+   898→      const t2 = t1 + 1.05
+   899→      const o = this.osc('sine', 84)
+   900→      const og = this.gn(0.0001)
+   901→      o.connect(og)
+   902→      og.connect(master)
+   903→      o.frequency.setValueAtTime(84, t2)
+   904→      o.frequency.exponentialRampToValueAtTime(46, t2 + 0.15)
+   905→      og.gain.setValueAtTime(0.0001, t2)
+   906→      og.gain.linearRampToValueAtTime(0.34, t2 + 0.014)
+   907→      og.gain.setTargetAtTime(0.0001, t2 + 0.03, 0.06)
+   908→      src.start(t0)
+   909→      o.start(t2)
+   910→      this.trackShot([src, o], [src, hp, lp, g, o, og], t2 + 0.6)
+   911→      this.click(t2 + 0.02, 1200, 0.12)
+   912→    })
+   913→  }
+   914→
+   915→  doorServo(): void {
+   916→    this.guard((ctx, master) => {
+   917→      const t0 = ctx.currentTime + 0.02
+   918→      const o = this.osc('sawtooth', 138)
+   919→      const lp = this.bq('lowpass', 560, 1.1)
+   920→      const g = this.gn(0.0001)
+   921→      o.connect(lp)
+   922→      lp.connect(g)
+   923→      g.connect(master)
+   924→      const wob = this.osc('sine', 7.5)
+   925→      const wd = this.gn(5.5)
+   926→      wob.connect(wd)
+   927→      wd.connect(o.frequency)
+   928→      o.frequency.setValueAtTime(138, t0)
+   929→      o.frequency.linearRampToValueAtTime(112, t0 + 0.5)
+   930→      g.gain.setValueAtTime(0.0001, t0)
+   931→      g.gain.linearRampToValueAtTime(0.14, t0 + 0.06)
+   932→      g.gain.setValueAtTime(0.14, t0 + 0.42)
+   933→      g.gain.setTargetAtTime(0.0001, t0 + 0.44, 0.06)
+   934→      o.start(t0)
+   935→      wob.start(t0)
+   936→      this.trackShot([o, wob], [o, wob, lp, g, wd], t0 + 0.9)
+   937→      this.click(t0 + 0.02, 1800, 0.07)
+   938→      this.click(t0 + 0.56, 2400, 0.1)
+   939→    })
+   940→  }
+   941→
+   942→  radioBlip(): void {
+   943→    this.guard((ctx) => {
+   944→      this.click(ctx.currentTime + 0.015, 1900, 0.16)
+   945→    })
+   946→  }
+   947→
+   948→  radioVoice(duration = 1.8): void {
+   949→    this.guard((ctx, master) => {
+   950→      const dur = Math.max(0.4, Math.min(4, num(duration, 1.8)))
+   951→      const t0 = ctx.currentTime + 0.05
+   952→      const end = t0 + dur
+   953→      // carrier: bandpassed noise with slow filter wobble
+   954→      const src = this.noise(true, 'white')
+   955→      const bp = this.bq('bandpass', 1750, 1.7)
+   956→      const wob = this.osc('sine', 0.5)
+   957→      const wd = this.gn(260)
+   958→      wob.connect(wd)
+   959→      wd.connect(bp.frequency)
+   960→      // syllable envelope on this gain (gates both noise + babble)
+   961→      const sg = this.gn(0.0001)
+   962→      src.connect(bp)
+   963→      bp.connect(sg)
+   964→      // voiced babble: sawtooth with random pitch steps per syllable
+   965→      const saw = this.osc('sawtooth', 120)
+   966→      const sbp = this.bq('bandpass', 1250, 2.2)
+   967→      const sv = this.gn(0.16)
+   968→      saw.connect(sbp)
+   969→      sbp.connect(sv)
+   970→      sv.connect(sg)
+   971→      const vib = this.osc('sine', 5.2)
+   972→      const vd = this.gn(3.5)
+   973→      vib.connect(vd)
+   974→      vd.connect(saw.frequency)
+   975→      const out = this.gn(0.5)
+   976→      sg.connect(out)
+   977→      out.connect(master)
+   978→      // schedule unintelligible syllables
+   979→      sg.gain.setValueAtTime(0.0001, t0)
+   980→      let t = t0 + 0.03
+   981→      while (t < end - 0.08) {
+   982→        const on = 0.05 + Math.random() * 0.16
+   983→        const off = 0.02 + Math.random() * 0.11
+   984→        sg.gain.setTargetAtTime(0.45 + Math.random() * 0.55, t, Math.min(0.03, on * 0.4))
+   985→        sg.gain.setTargetAtTime(0.04 + Math.random() * 0.08, t + on, 0.02)
+   986→        saw.frequency.setValueAtTime(85 + Math.random() * 95, t)
+   987→        t += on + off
+   988→      }
+   989→      sg.gain.setTargetAtTime(0.0001, end - 0.05, 0.03)
+   990→      // squelch tails
+   991→      this.click(t0 - 0.01, 1900, 0.14)
+   992→      this.click(end + 0.02, 2100, 0.12)
+   993→      src.start(t0)
+   994→      wob.start(t0)
+   995→      saw.start(t0)
+   996→      vib.start(t0)
+   997→      this.trackShot(
+   998→        [src, wob, saw, vib],
+   999→        [src, bp, wob, wd, sg, saw, sbp, sv, vib, vd, out],
+  1000→        end + 0.25
+  1001→      )
+  1002→    })
+  1003→  }
+  1004→
+  1005→  alarmPing(): void {
+  1006→    this.guard((ctx) => {
+  1007→      const t = ctx.currentTime + 0.01
+  1008→      this.tone(t, 830, 0.32, 0.14, 'sine')
+  1009→      this.tone(t, 1660, 0.28, 0.035, 'sine')
+  1010→    })
+  1011→  }
+  1012→
+  1013→  thud(intensity = 1): void {
+  1014→    this.guard((ctx, master) => {
+  1015→      const v = clamp01(intensity)
+  1016→      if (v <= 0.001) return
+  1017→      const t0 = ctx.currentTime + 0.01
+  1018→      // sub-bass body
+  1019→      const o = this.osc('sine', 58)
+  1020→      const g = this.gn(0.0001)
+  1021→      o.connect(g)
+  1022→      g.connect(master)
+  1023→      o.frequency.setValueAtTime(58, t0)
+  1024→      o.frequency.exponentialRampToValueAtTime(27, t0 + 0.3)
+  1025→      g.gain.setValueAtTime(0.0001, t0)
+  1026→      g.gain.linearRampToValueAtTime(0.55 * v, t0 + 0.012)
+  1027→      g.gain.setTargetAtTime(0.0001, t0 + 0.02, 0.09)
+  1028→      // dull impact noise
+  1029→      const src = this.noise(true, 'brown')
+  1030→      const lp = this.bq('lowpass', 130, 0.6)
+  1031→      const ng = this.gn(0.0001)
+  1032→      src.connect(lp)
+  1033→      lp.connect(ng)
+  1034→      ng.connect(master)
+  1035→      ng.gain.setValueAtTime(0.0001, t0)
+  1036→      ng.gain.linearRampToValueAtTime(0.4 * v, t0 + 0.015)
+  1037→      ng.gain.setTargetAtTime(0.0001, t0 + 0.03, 0.12)
+  1038→      o.start(t0)
+  1039→      src.start(t0)
+  1040→      this.trackShot([o, src], [o, g, src, lp, ng], t0 + 0.9)
+  1041→    })
+  1042→  }
+  1043→
+  1044→  meteorBoom(): void {
+  1045→    this.guard((ctx, master) => {
+  1046→      const t0 = ctx.currentTime + 0.02
+  1047→      // distant muffled boom — lowpassed brown noise, slow swell
+  1048→      const src = this.noise(true, 'brown')
+  1049→      const lp = this.bq('lowpass', 170, 0.5)
+  1050→      const g = this.gn(0.0001)
+  1051→      src.connect(lp)
+  1052→      lp.connect(g)
+  1053→      g.connect(master)
+  1054→      g.gain.setValueAtTime(0.0001, t0)
+  1055→      g.gain.linearRampToValueAtTime(0.5, t0 + 0.12)
+  1056→      g.gain.setTargetAtTime(0.0001, t0 + 0.18, 0.55)
+  1057→      // deep sub tail
+  1058→      const sub = this.osc('sine', 42)
+  1059→      const sg = this.gn(0.0001)
+  1060→      sub.connect(sg)
+  1061→      sg.connect(master)
+  1062→      sub.frequency.setValueAtTime(42, t0)
+  1063→      sub.frequency.exponentialRampToValueAtTime(28, t0 + 1.1)
+  1064→      sg.gain.setValueAtTime(0.0001, t0)
+  1065→      sg.gain.linearRampToValueAtTime(0.3, t0 + 0.07)
+  1066→      sg.gain.setTargetAtTime(0.0001, t0 + 0.15, 0.35)
+  1067→      // sparse debris crackle
+  1068→      const cr = this.noise(true, 'white')
+  1069→      const cbp = this.bq('bandpass', 3100, 0.9)
+  1070→      const cg = this.gn(0.0001)
+  1071→      cr.connect(cbp)
+  1072→      cbp.connect(cg)
+  1073→      cg.connect(master)
+  1074→      cg.gain.setValueAtTime(0.0001, t0)
+  1075→      let ct = t0 + 0.35
+  1076→      for (let i = 0; i < 11; i++) {
+  1077→        cg.gain.setValueAtTime(0.015 + Math.random() * 0.05, ct)
+  1078→        cg.gain.setTargetAtTime(0.0001, ct + 0.012, 0.02)
+  1079→        ct += 0.07 + Math.random() * 0.22
+  1080→      }
+  1081→      src.start(t0)
+  1082→      sub.start(t0)
+  1083→      cr.start(t0)
+  1084→      this.trackShot([src, sub, cr], [src, lp, g, sub, sg, cr, cbp, cg], t0 + 3)
+  1085→    })
+  1086→  }
+  1087→
+  1088→  leakHiss(): string {
+  1089→    if (!this.ready || !this.ctx || !this.master) return ''
+  1090→    const id = `leak-${++this.loopCounter}`
+  1091→    try {
+  1092→      const loop = this.ensureLoop(id, this.listenerPos, (out) => {
+  1093→        const ctx = this.ctx
+  1094→        if (!ctx) return null
+  1095→        const src = this.noise(true, 'white')
+  1096→        const hp = this.bq('highpass', 1500, 0.7)
+  1097→        const bp = this.bq('bandpass', 3200, 1.1)
+  1098→        const flut = this.osc('sine', 6.5 + Math.random() * 4)
+  1099→        const fd = this.gn(420)
+  1100→        flut.connect(fd)
+  1101→        fd.connect(bp.frequency)
+  1102→        const g = this.gn(0.5)
+  1103→        src.connect(hp)
+  1104→        hp.connect(bp)
+  1105→        bp.connect(g)
+  1106→        g.connect(out)
+  1107→        src.start()
+  1108→        flut.start()
+  1109→        return {
+  1110→          sources: [src, flut],
+  1111→          cleanup: [src, hp, bp, g, flut, fd],
+  1112→          params: {},
+  1113→        }
+  1114→      })
+  1115→      if (!loop || !this.ctx) return ''
+  1116→      loop.ctrl.gain.setTargetAtTime(0.85, this.ctx.currentTime, 0.25)
+  1117→      return id
+  1118→    } catch {
+  1119→      return ''
+  1120→    }
+  1121→  }
+  1122→
+  1123→  touchdown(): void {
+  1124→    this.guard((ctx, master) => {
+  1125→      const t0 = ctx.currentTime + 0.02
+  1126→      // dust thump
+  1127→      const src = this.noise(true, 'brown')
+  1128→      const lp = this.bq('lowpass', 95, 0.7)
+  1129→      const g = this.gn(0.0001)
+  1130→      src.connect(lp)
+  1131→      lp.connect(g)
+  1132→      g.connect(master)
+  1133→      g.gain.setValueAtTime(0.0001, t0)
+  1134→      g.gain.linearRampToValueAtTime(0.5, t0 + 0.02)
+  1135→      g.gain.setTargetAtTime(0.0001, t0 + 0.04, 0.13)
+  1136→      // dust puff
+  1137→      const dust = this.noise(true, 'white')
+  1138→      const bp = this.bq('bandpass', 850, 0.6)
+  1139→      const dg = this.gn(0.0001)
+  1140→      dust.connect(bp)
+  1141→      bp.connect(dg)
+  1142→      dg.connect(master)
+  1143→      dg.gain.setValueAtTime(0.0001, t0)
+  1144→      dg.gain.linearRampToValueAtTime(0.16, t0 + 0.03)
+  1145→      dg.gain.setTargetAtTime(0.0001, t0 + 0.06, 0.28)
+  1146→      // settling grit ticks
+  1147→      const grit = this.noise(true, 'white')
+  1148→      const gbp = this.bq('bandpass', 1500, 1.1)
+  1149→      const gg = this.gn(0.0001)
+  1150→      grit.connect(gbp)
+  1151→      gbp.connect(gg)
+  1152→      gg.connect(master)
+  1153→      gg.gain.setValueAtTime(0.0001, t0)
+  1154→      let ct = t0 + 0.15
+  1155→      for (let i = 0; i < 7; i++) {
+  1156→        gg.gain.setValueAtTime(0.055 * (1 - i * 0.11), ct)
+  1157→        gg.gain.setTargetAtTime(0.0001, ct + 0.01, 0.02)
+  1158→        ct += 0.1 + Math.random() * 0.18
+  1159→      }
+  1160→      src.start(t0)
+  1161→      dust.start(t0)
+  1162→      grit.start(t0)
+  1163→      this.trackShot([src, dust, grit], [src, lp, g, dust, bp, dg, grit, gbp, gg], t0 + 1.8)
+  1164→    })
+  1165→  }
+  1166→
+  1167→  success(): void {
+  1168→    this.guard((ctx) => {
+  1169→      const t = ctx.currentTime + 0.02
+  1170→      this.tone(t, 660, 0.16, 0.14, 'sine')
+  1171→      this.tone(t + 0.15, 880, 0.3, 0.14, 'sine')
+  1172→    })
+  1173→  }
+  1174→
+  1175→  constructorCue(stage: number): void {
+  1176→    if (stage === 2) {
+  1177→      // weld / assembly
+  1178→      this.toolWeld(1.5)
+  1179→      this.guard((ctx) => {
+  1180→        const t = ctx.currentTime + 0.4
+  1181→        this.tone(t, 1250, 0.12, 0.05, 'triangle')
+  1182→        this.tone(t + 0.55, 940, 0.12, 0.045, 'triangle')
+  1183→      })
+  1184→      return
+  1185→    }
+  1186→    if (stage === 3) {
+  1187→      // complete — soft ascending three-tone confirm
+  1188→      this.guard((ctx) => {
+  1189→        const t = ctx.currentTime + 0.02
+  1190→        this.tone(t, 523, 0.18, 0.12, 'sine')
+  1191→        this.tone(t + 0.17, 659, 0.18, 0.12, 'sine')
+  1192→        this.tone(t + 0.34, 784, 0.42, 0.14, 'sine')
+  1193→        this.tone(t + 0.34, 392, 0.5, 0.05, 'triangle')
+  1194→      })
+  1195→      return
+  1196→    }
+  1197→    if (stage === 0) {
+  1198→      // rover arrives — diesel-less electric approach, brake hiss, clunk
+  1199→      this.guard((ctx, master) => {
+  1200→        const t0 = ctx.currentTime + 0.05
+  1201→        const saw = this.osc('sawtooth', 52)
+  1202→        const lp = this.bq('lowpass', 260, 0.8)
+  1203→        const g = this.gn(0.0001)
+  1204→        saw.connect(lp)
+  1205→        lp.connect(g)
+  1206→        g.connect(master)
+  1207→        saw.frequency.setValueAtTime(52, t0)
+  1208→        saw.frequency.linearRampToValueAtTime(96, t0 + 1.1)
+  1209→        saw.frequency.linearRampToValueAtTime(40, t0 + 1.7)
+  1210→        g.gain.setValueAtTime(0.0001, t0)
+  1211→        g.gain.linearRampToValueAtTime(0.2, t0 + 0.9)
+  1212→        g.gain.setTargetAtTime(0.0001, t0 + 1.3, 0.18)
+  1213→        // rumble bed
+  1214→        const rn = this.noise(true, 'brown')
+  1215→        const rlp = this.bq('lowpass', 140, 0.7)
+  1216→        const rg = this.gn(0.0001)
+  1217→        rn.connect(rlp)
+  1218→        rlp.connect(rg)
+  1219→        rg.connect(master)
+  1220→        rg.gain.setValueAtTime(0.0001, t0)
+  1221→        rg.gain.linearRampToValueAtTime(0.17, t0 + 0.8)
+  1222→        rg.gain.setTargetAtTime(0.0001, t0 + 1.2, 0.3)
+  1223→        // brake hiss
+  1224→        const hn = this.noise(true, 'white')
+  1225→        const hbp = this.bq('bandpass', 2100, 0.9)
+  1226→        const hg = this.gn(0.0001)
+  1227→        hn.connect(hbp)
+  1228→        hbp.connect(hg)
+  1229→        hg.connect(master)
+  1230→        hg.gain.setValueAtTime(0.0001, t0 + 1.45)
+  1231→        hg.gain.linearRampToValueAtTime(0.13, t0 + 1.52)
+  1232→        hg.gain.setTargetAtTime(0.0001, t0 + 1.56, 0.06)
+  1233→        // final clunk
+  1234→        const cl = this.osc('sine', 66)
+  1235→        const cg = this.gn(0.0001)
+  1236→        cl.connect(cg)
+  1237→        cg.connect(master)
+  1238→        cl.frequency.setValueAtTime(66, t0 + 1.75)
+  1239→        cl.frequency.exponentialRampToValueAtTime(38, t0 + 1.9)
+  1240→        cg.gain.setValueAtTime(0.0001, t0 + 1.75)
+  1241→        cg.gain.linearRampToValueAtTime(0.3, t0 + 1.76)
+  1242→        cg.gain.setTargetAtTime(0.0001, t0 + 1.78, 0.07)
+  1243→        saw.start(t0)
+  1244→        rn.start(t0)
+  1245→        hn.start(t0)
+  1246→        cl.start(t0 + 1.7)
+  1247→        this.trackShot([saw, rn, hn, cl], [saw, lp, g, rn, rlp, rg, hn, hbp, hg, cl, cg], t0 + 2.3)
+  1248→      })
+  1249→      return
+  1250→    }
+  1251→    if (stage === 1) {
+  1252→      // crane operate — servo steps + hydraulic thunk
+  1253→      this.guard((ctx, master) => {
+  1254→        const t0 = ctx.currentTime + 0.05
+  1255→        const sq = this.osc('square', 760)
+  1256→        const bp = this.bq('bandpass', 950, 6)
+  1257→        const g = this.gn(0.0001)
+  1258→        sq.connect(bp)
+  1259→        bp.connect(g)
+  1260→        g.connect(master)
+  1261→        sq.frequency.setValueAtTime(760, t0)
+  1262→        sq.frequency.setValueAtTime(920, t0 + 0.45)
+  1263→        sq.frequency.setValueAtTime(690, t0 + 0.95)
+  1264→        g.gain.setValueAtTime(0.0001, t0)
+  1265→        g.gain.linearRampToValueAtTime(0.08, t0 + 0.08)
+  1266→        g.gain.setValueAtTime(0.08, t0 + 1.0)
+  1267→        g.gain.setTargetAtTime(0.0001, t0 + 1.02, 0.1)
+  1268→        // hydraulic thunk at the end of the move
+  1269→        const t1 = t0 + 1.15
+  1270→        const o = this.osc('sine', 58)
+  1271→        const og = this.gn(0.0001)
+  1272→        o.connect(og)
+  1273→        og.connect(master)
+  1274→        o.frequency.setValueAtTime(58, t1)
+  1275→        o.frequency.exponentialRampToValueAtTime(36, t1 + 0.16)
+  1276→        og.gain.setValueAtTime(0.0001, t1)
+  1277→        og.gain.linearRampToValueAtTime(0.3, t1 + 0.014)
+  1278→        og.gain.setTargetAtTime(0.0001, t1 + 0.03, 0.07)
+  1279→        const th = this.noise(true, 'brown')
+  1280→        const tlp = this.bq('lowpass', 110, 0.7)
+  1281→        const tg = this.gn(0.0001)
+  1282→        th.connect(tlp)
+  1283→        tlp.connect(tg)
+  1284→        tg.connect(master)
+  1285→        tg.gain.setValueAtTime(0.0001, t1)
+  1286→        tg.gain.linearRampToValueAtTime(0.22, t1 + 0.02)
+  1287→        tg.gain.setTargetAtTime(0.0001, t1 + 0.04, 0.1)
+  1288→        sq.start(t0)
+  1289→        o.start(t1)
+  1290→        th.start(t1)
+  1291→        this.trackShot([sq, o, th], [sq, bp, g, o, og, th, tlp, tg], t1 + 0.7)
+  1292→      })
+  1293→    }
+  1294→  }
+  1295→
+  1296→  // ================================================================
+  1297→  // Generic loop control
+  1298→  // ================================================================
+  1299→
+  1300→  stopLoop(handle: string): void {
+  1301→    if (!handle) return
+  1302→    this.killLoop(handle, 0.15)
+  1303→  }
+  1304→
+  1305→  setLoopPosition(handle: string, pos: AudioPosition): void {
+  1306→    if (!handle || !pos) return
+  1307→    const loop = this.loops.get(handle)
+  1308→    if (!loop || !loop.panner || !this.ready) return
+  1309→    this.setNodePos(loop.panner, {
+  1310→      x: num(pos.x, 0),
+  1311→      y: num(pos.y, 0),
+  1312→      z: num(pos.z, 0),
+  1313→    })
+  1314→  }
+  1315→
+  1316→  // ================================================================
+  1317→  // Internals
+  1318→  // ================================================================
+  1319→
+  1320→  private makeNoiseBuffer(kind: 'white' | 'brown'): AudioBuffer {
+  1321→    const ctx = this.ctx
+  1322→    if (!ctx) throw new Error('no context')
+  1323→    const len = Math.floor(ctx.sampleRate * 2)
+  1324→    const buf = ctx.createBuffer(1, len, ctx.sampleRate)
+  1325→    const d = buf.getChannelData(0)
+  1326→    if (kind === 'white') {
+  1327→      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1
+  1328→    } else {
+  1329→      // brown noise: integrated white, normalized
+  1330→      let last = 0
+  1331→      let peak = 0
+  1332→      for (let i = 0; i < len; i++) {
+  1333→        const w = Math.random() * 2 - 1
+  1334→        last = (last + 0.02 * w) / 1.02
+  1335→        d[i] = last
+  1336→        const a = Math.abs(last)
+  1337→        if (a > peak) peak = a
+  1338→      }
+  1339→      if (peak > 1e-6) {
+  1340→        const k = 0.9 / peak
+  1341→        for (let i = 0; i < len; i++) d[i] *= k
+  1342→      }
+  1343→    }
+  1344→    return buf
+  1345→  }
+  1346→
+  1347→  private buildAmbience(): void {
+  1348→    const ctx = this.ctx
+  1349→    const master = this.master
+  1350→    if (!ctx || !master) return
+  1351→
+  1352→    // ---- outside wind (crossfaded, planet-flavored) ----
+  1353→    const wWhite = this.noise(true, 'white')
+  1354→    const wBrown = this.noise(true, 'brown')
+  1355→    this.windWhiteG = this.gn(0.9)
+  1356→    this.windBrownG = this.gn(0.1)
+  1357→    const windHP = this.bq('highpass', 60, 0.7)
+  1358→    this.windFilter = this.bq('bandpass', 1050, 0.55) // moon flavor; mars set in applyAmbience
+  1359→    const gustG = this.gn(0.62)
+  1360→    this.windGain = this.gn(0)
+  1361→    wWhite.connect(this.windWhiteG)
+  1362→    wBrown.connect(this.windBrownG)
+  1363→    this.windWhiteG.connect(windHP)
+  1364→    this.windBrownG.connect(windHP)
+  1365→    windHP.connect(this.windFilter)
+  1366→    this.windFilter.connect(gustG)
+  1367→    gustG.connect(this.windGain)
+  1368→    this.windGain.connect(master)
+  1369→    // slow organic gusting (two LFOs) + filter movement
+  1370→    const gustLfo = this.osc('sine', 0.06)
+  1371→    const gustDepth = this.gn(0.38)
+  1372→    gustLfo.connect(gustDepth)
+  1373→    gustDepth.connect(gustG.gain)
+  1374→    const gustLfo2 = this.osc('sine', 0.17)
+  1375→    const gustDepth2 = this.gn(0.1)
+  1376→    gustLfo2.connect(gustDepth2)
+  1377→    gustDepth2.connect(gustG.gain)
+  1378→    const filtDepth = this.gn(170)
+  1379→    gustLfo.connect(filtDepth)
+  1380→    filtDepth.connect(this.windFilter.frequency)
+  1381→    wWhite.start()
+  1382→    wBrown.start()
+  1383→    gustLfo.start()
+  1384→    gustLfo2.start()
+  1385→
+  1386→    // ---- storm layer (dust storm / solar storm rattle) ----
+  1387→    const sSrc = this.noise(true, 'white')
+  1388→    const sBP = this.bq('bandpass', 640, 0.7)
+  1389→    const sGust = this.gn(0.55)
+  1390→    this.stormGain = this.gn(0)
+  1391→    sSrc.connect(sBP)
+  1392→    sBP.connect(sGust)
+  1393→    sGust.connect(this.stormGain)
+  1394→    this.stormGain.connect(master)
+  1395→    const sLfo = this.osc('sine', 0.23)
+  1396→    const sDepth = this.gn(0.45)
+  1397→    sLfo.connect(sDepth)
+  1398→    sDepth.connect(sGust.gain)
+  1399→    sSrc.start()
+  1400→    sLfo.start()
+  1401→
+  1402→    // ---- interior room tone: very low hum + faint air ----
+  1403→    const hum1 = this.osc('sine', 52)
+  1404→    const hum2 = this.osc('sine', 104)
+  1405→    const h1 = this.gn(0.6)
+  1406→    const h2 = this.gn(0.22)
+  1407→    const humG = this.gn(0.05)
+  1408→    hum1.connect(h1)
+  1409→    hum2.connect(h2)
+  1410→    h1.connect(humG)
+  1411→    h2.connect(humG)
+  1412→    const rAir = this.noise(true, 'white')
+  1413→    const rLP = this.bq('lowpass', 340, 0.6)
+  1414→    const rAirG = this.gn(0.055)
+  1415→    rAir.connect(rLP)
+  1416→    rLP.connect(rAirG)
+  1417→    this.roomGain = this.gn(0)
+  1418→    humG.connect(this.roomGain)
+  1419→    rAirG.connect(this.roomGain)
+  1420→    this.roomGain.connect(master)
+  1421→    hum1.start()
+  1422→    hum2.start()
+  1423→    rAir.start()
+  1424→
+  1425→    // ---- interior life-support fan (setFan controls level) ----
+  1426→    const fSrc = this.noise(true, 'white')
+  1427→    const fBP = this.bq('bandpass', 270, 1.3)
+  1428→    const fG = this.gn(0.5)
+  1429→    this.fanGain = this.gn(0)
+  1430→    fSrc.connect(fBP)
+  1431→    fBP.connect(fG)
+  1432→    fG.connect(this.fanGain)
+  1433→    this.fanGain.connect(master)
+  1434→    const fLfo = this.osc('sine', 3.1)
+  1435→    const fDepth = this.gn(0.12)
+  1436→    fLfo.connect(fDepth)
+  1437→    fDepth.connect(fG.gain)
+  1438→    const fBlade = this.osc('sine', 14)
+  1439→    const fBladeD = this.gn(24)
+  1440→    fBlade.connect(fBladeD)
+  1441→    fBladeD.connect(fBP.frequency)
+  1442→    fSrc.start()
+  1443→    fLfo.start()
+  1444→    fBlade.start()
+  1445→  }
+  1446→
+  1447→  private applyAmbience(): void {
+  1448→    const ctx = this.ctx
+  1449→    if (!ctx || !this.ready) return
+  1450→    const t = ctx.currentTime
+  1451→    const { inside, planet, windIntensity, storm } = this.env
+  1452→    const wi = windIntensity
+  1453→
+  1454→    // planet timbre (rare change)
+  1455→    if (this.windFilter && this.windWhiteG && this.windBrownG && this.apPlanet !== planet) {
+  1456→      this.apPlanet = planet
+  1457→      try {
+  1458→        if (planet === 'moon') {
+  1459→          // thin / airy
+  1460→          this.windFilter.type = 'bandpass'
+  1461→          this.windFilter.frequency.setTargetAtTime(1050, t, 0.4)
+  1462→          this.windFilter.Q.setTargetAtTime(0.55, t, 0.4)
+  1463→          this.windWhiteG.gain.setTargetAtTime(0.9, t, 0.5)
+  1464→          this.windBrownG.gain.setTargetAtTime(0.1, t, 0.5)
+  1465→        } else {
+  1466→          // lower / rumblier
+  1467→          this.windFilter.type = 'lowpass'
+  1468→          this.windFilter.frequency.setTargetAtTime(470, t, 0.4)
+  1469→          this.windFilter.Q.setTargetAtTime(0.9, t, 0.4)
+  1470→          this.windWhiteG.gain.setTargetAtTime(0.3, t, 0.5)
+  1471→          this.windBrownG.gain.setTargetAtTime(0.65, t, 0.5)
+  1472→        }
+  1473→      } catch {
+  1474→        /* ignore */
+  1475→      }
+  1476→    }
+  1477→
+  1478→    // wind level (muffled + reduced when inside; storms raise it a lot)
+  1479→    let wind = inside ? 0.05 + wi * 0.03 : 0.05 + wi * 0.2
+  1480→    if (planet === 'moon') wind *= 0.85
+  1481→    if (storm) wind = inside ? Math.max(wind, 0.15) : Math.min(0.55, wind * 2.3 + 0.13)
+  1482→    if (this.windGain && Math.abs(wind - this.apWind) > 0.003) {
+  1483→      this.apWind = wind
+  1484→      try {
+  1485→        this.windGain.gain.setTargetAtTime(wind, t, inside ? 0.4 : 0.9)
+  1486→      } catch {
+  1487→        /* ignore */
+  1488→      }
+  1489→    }
+  1490→
+  1491→    // storm rattle layer
+  1492→    const stormLvl = storm ? (inside ? 0.13 : 0.32 + wi * 0.2) : 0
+  1493→    if (this.stormGain && Math.abs(stormLvl - this.apStorm) > 0.003) {
+  1494→      this.apStorm = stormLvl
+  1495→      try {
+  1496→        this.stormGain.gain.setTargetAtTime(stormLvl, t, 1.1)
+  1497→      } catch {
+  1498→        /* ignore */
+  1499→      }
+  1500→    }
+  1501→
+  1502→    // room tone crossfade
+  1503→    const room = inside ? 1 : 0
+  1504→    if (this.roomGain && room !== this.apRoom) {
+  1505→      this.apRoom = room
+  1506→      try {
+  1507→        this.roomGain.gain.setTargetAtTime(room, t, 0.5)
+  1508→      } catch {
+  1509→        /* ignore */
+  1510→      }
+  1511→    }
+  1512→
+  1513→    // fan crossfade (only audible inside)
+  1514→    const fan = inside ? clamp01(this.fanLevel) * 0.5 : 0
+  1515→    if (this.fanGain && Math.abs(fan - this.apFan) > 0.003) {
+  1516→      this.apFan = fan
+  1517→      try {
+  1518→        this.fanGain.gain.setTargetAtTime(fan, t, 0.45)
+  1519→      } catch {
+  1520→        /* ignore */
+  1521→      }
+  1522→    }
+  1523→
+  1524→    // breathing is automatically silenced inside the suit-off interior
+  1525→    this.applyBreathing()
+  1526→  }
+  1527→
+  1528→  private applyBreathing(): void {
+  1529→    const ctx = this.ctx
+  1530→    if (!ctx || !this.ready) return
+  1531→    const t = ctx.currentTime
+  1532→    const active = this.breathOn && !this.env.inside
+  1533→    const effort = clamp01(this.breathEffort)
+  1534→    if (active) {
+  1535→      const loop = this.ensureLoop('breath', null, (out) => this.buildBreath(out))
+  1536→      if (!loop) return
+  1537→      const vol = 0.3 + effort * 0.55
+  1538→      const rate = 0.24 + effort * 0.26 // ~0.25Hz at rest -> ~0.5Hz under effort
+  1539→      if (Math.abs(vol - this.apBreath) > 0.01) {
+  1540→        this.apBreath = vol
+  1541→        try {
+  1542→          loop.ctrl.gain.setTargetAtTime(vol, t, 0.5)
+  1543→        } catch {
+  1544→          /* ignore */
+  1545→        }
+  1546→      }
+  1547→      if (Math.abs(rate - this.apBreathRate) > 0.01) {
+  1548→        this.apBreathRate = rate
+  1549→        try {
+  1550→          loop.params.rate.setTargetAtTime(rate, t, 0.6)
+  1551→        } catch {
+  1552→          /* ignore */
+  1553→        }
+  1554→      }
+  1555→    } else {
+  1556→      this.apBreath = -1
+  1557→      this.apBreathRate = -1
+  1558→      if (this.loops.has('breath')) this.killLoop('breath', 0.6)
+  1559→    }
+  1560→  }
+  1561→
+  1562→  // ---------- loop builders ----------
+  1563→
+  1564→  private buildBreath(out: GainNode): LoopParts | null {
+  1565→    const ctx = this.ctx
+  1566→    if (!ctx) return null
+  1567→    const src = this.noise(true, 'white')
+  1568→    const bp = this.bq('bandpass', 430, 1.0)
+  1569→    const env = this.gn(0)
+  1570→    src.connect(bp)
+  1571→    bp.connect(env)
+  1572→    env.connect(out)
+  1573→    // rectified LFO gives alternating inhale/exhale bursts
+  1574→    const lfo = this.osc('sine', 0.25)
+  1575→    const shaper = ctx.createWaveShaper()
+  1576→    const n = 129
+  1577→    const curve = new Float32Array(n)
+  1578→    for (let i = 0; i < n; i++) {
+  1579→      const x = (i / (n - 1)) * 2 - 1
+  1580→      curve[i] = Math.abs(x)
+  1581→    }
+  1582→    shaper.curve = curve
+  1583→    const depth = this.gn(0.55)
+  1584→    lfo.connect(shaper)
+  1585→    shaper.connect(depth)
+  1586→    depth.connect(env.gain)
+  1587→    // inhale brighter / exhale darker
+  1588→    const fd = this.gn(115)
+  1589→    lfo.connect(fd)
+  1590→    fd.connect(bp.frequency)
+  1591→    src.start()
+  1592→    lfo.start()
+  1593→    return {
+  1594→      sources: [src, lfo],
+  1595→      cleanup: [src, bp, env, lfo, shaper, depth, fd],
+  1596→      params: { rate: lfo.frequency },
+  1597→    }
+  1598→  }
+  1599→
+  1600→  private buildRover(out: GainNode): LoopParts | null {
+  1601→    const ctx = this.ctx
+  1602→    if (!ctx) return null
+  1603→    // electric motor whine
+  1604→    const saw = this.osc('sawtooth', 90)
+  1605→    const sub = this.osc('sine', 45)
+  1606→    const lp = this.bq('lowpass', 420, 0.8)
+  1607→    const eg = this.gn(0.1)
+  1608→    const sg = this.gn(0.12)
+  1609→    const vib = this.osc('sine', 6.2)
+  1610→    const vd = this.gn(2.6)
+  1611→    vib.connect(vd)
+  1612→    vd.connect(saw.frequency)
+  1613→    vd.connect(sub.frequency)
+  1614→    saw.connect(lp)
+  1615→    lp.connect(eg)
+  1616→    sub.connect(sg)
+  1617→    // wheel / traction noise
+  1618→    const wsrc = this.noise(true, 'brown')
+  1619→    const wbp = this.bq('bandpass', 230, 0.9)
+  1620→    const wg = this.gn(0.0001)
+  1621→    wsrc.connect(wbp)
+  1622→    wbp.connect(wg)
+  1623→    eg.connect(out)
+  1624→    sg.connect(out)
+  1625→    wg.connect(out)
+  1626→    saw.start()
+  1627→    sub.start()
+  1628→    vib.start()
+  1629→    wsrc.start()
+  1630→    return {
+  1631→      sources: [saw, sub, vib, wsrc],
+  1632→      cleanup: [saw, sub, vib, vd, lp, eg, sg, wsrc, wbp, wg],
+  1633→      params: { freq: saw.frequency, sub: sub.frequency, lp: lp.frequency, eng: eg.gain, wheel: wg.gain },
+  1634→    }
+  1635→  }
+  1636→
+  1637→  private buildMotor(out: GainNode): LoopParts | null {
+  1638→    const ctx = this.ctx
+  1639→    if (!ctx) return null
+  1640→    // hydraulic pump
+  1641→    const pump = this.osc('sawtooth', 44)
+  1642→    const plp = this.bq('lowpass', 180, 0.8)
+  1643→    const pg = this.gn(0.5)
+  1644→    // hydraulic fluid rush with slow wobble
+  1645→    const hyd = this.noise(true, 'brown')
+  1646→    const hlp = this.bq('lowpass', 150, 0.7)
+  1647→    const hg = this.gn(0.4)
+  1648→    const wob = this.osc('sine', 3.6)
+  1649→    const wd = this.gn(0.12)
+  1650→    wob.connect(wd)
+  1651→    wd.connect(hg.gain)
+  1652→    // servo whine
+  1653→    const servo = this.osc('square', 700)
+  1654→    const sbp = this.bq('bandpass', 950, 5)
+  1655→    const sg = this.gn(0.06)
+  1656→    const mix = this.gn(0.5)
+  1657→    pump.connect(plp)
+  1658→    plp.connect(pg)
+  1659→    pg.connect(mix)
+  1660→    hyd.connect(hlp)
+  1661→    hlp.connect(hg)
+  1662→    hg.connect(mix)
+  1663→    servo.connect(sbp)
+  1664→    sbp.connect(sg)
+  1665→    sg.connect(mix)
+  1666→    mix.connect(out)
+  1667→    pump.start()
+  1668→    hyd.start()
+  1669→    wob.start()
+  1670→    servo.start()
+  1671→    return {
+  1672→      sources: [pump, hyd, wob, servo],
+  1673→      cleanup: [pump, plp, pg, hyd, hlp, hg, wob, wd, servo, sbp, sg, mix],
+  1674→      params: { servo: servo.frequency, main: mix.gain },
+  1675→    }
+  1676→  }
+  1677→
+  1678→  private buildBurn(out: GainNode): LoopParts | null {
+  1679→    const ctx = this.ctx
+  1680→    if (!ctx) return null
+  1681→    // low rumble with turbulence
+  1682→    const rum = this.noise(true, 'brown')
+  1683→    const rlp = this.bq('lowpass', 115, 0.6)
+  1684→    const rg = this.gn(0.8)
+  1685→    const rlfo = this.osc('sine', 8.5)
+  1686→    const rd = this.gn(0.22)
+  1687→    rlfo.connect(rd)
+  1688→    rd.connect(rg.gain)
+  1689→    const rfl = this.osc('sine', 1.7)
+  1690→    const rfd = this.gn(32)
+  1691→    rfl.connect(rfd)
+  1692→    rfd.connect(rlp.frequency)
+  1693→    // vapor hiss
+  1694→    const hiss = this.noise(true, 'white')
+  1695→    const hhp = this.bq('highpass', 2100, 0.7)
+  1696→    const hg = this.gn(0.4)
+  1697→    const hlfo = this.osc('sine', 12.7)
+  1698→    const hd = this.gn(0.12)
+  1699→    hlfo.connect(hd)
+  1700→    hd.connect(hg.gain)
+  1701→    rum.connect(rlp)
+  1702→    rlp.connect(rg)
+  1703→    hiss.connect(hhp)
+  1704→    hhp.connect(hg)
+  1705→    rg.connect(out)
+  1706→    hg.connect(out)
+  1707→    rum.start()
+  1708→    hiss.start()
+  1709→    rlfo.start()
+  1710→    rfl.start()
+  1711→    hlfo.start()
+  1712→    return {
+  1713→      sources: [rum, hiss, rlfo, rfl, hlfo],
+  1714→      cleanup: [rum, rlp, rg, rlfo, rd, rfl, rfd, hiss, hhp, hg, hlfo, hd],
+  1715→      params: {},
+  1716→    }
+  1717→  }
+  1718→
+  1719→  // ---------- loop infrastructure ----------
+  1720→
+  1721→  private ensureLoop(
+  1722→    id: string,
+  1723→    pos: AudioPosition | null,
+  1724→    build: (out: GainNode) => LoopParts | null
+  1725→  ): LoopNode | null {
+  1726→    const existing = this.loops.get(id)
+  1727→    if (existing) return existing
+  1728→    const ctx = this.ctx
+  1729→    const master = this.master
+  1730→    if (!ctx || !master) return null
+  1731→    try {
+  1732→      const ctrl = ctx.createGain()
+  1733→      ctrl.gain.value = 0
+  1734→      let panner: PannerNode | null = null
+  1735→      if (pos) panner = this.makePanner(pos)
+  1736→      if (panner) {
+  1737→        ctrl.connect(panner)
+  1738→        panner.connect(master)
+  1739→      } else {
+  1740→        ctrl.connect(master)
+  1741→      }
+  1742→      const parts = build(ctrl)
+  1743→      if (!parts) {
+  1744→        try {
+  1745→          ctrl.disconnect()
+  1746→          if (panner) panner.disconnect()
+  1747→        } catch {
+  1748→          /* ignore */
+  1749→        }
+  1750→        return null
+  1751→      }
+  1752→      const loop: LoopNode = {
+  1753→        id,
+  1754→        ctrl,
+  1755→        panner,
+  1756→        sources: parts.sources,
+  1757→        cleanup: [ctrl, ...(panner ? [panner] : []), ...parts.cleanup],
+  1758→        params: parts.params,
+  1759→      }
+  1760→      this.loops.set(id, loop)
+  1761→      return loop
+  1762→    } catch {
+  1763→      return null
+  1764→    }
+  1765→  }
+  1766→
+  1767→  private killLoop(id: string, fade: number): void {
+  1768→    const loop = this.loops.get(id)
+  1769→    if (!loop) return
+  1770→    this.loops.delete(id)
+  1771→    const ctx = this.ctx
+  1772→    if (!ctx) return
+  1773→    const t = ctx.currentTime
+  1774→    const f = Math.max(0.05, fade)
+  1775→    try {
+  1776→      loop.ctrl.gain.setTargetAtTime(0.0001, t, f / 3)
+  1777→    } catch {
+  1778→      /* ignore */
+  1779→    }
+  1780→    const stopAt = t + f + 0.15
+  1781→    let stopped = false
+  1782→    const dispose = (): void => {
+  1783→      if (stopped) return
+  1784→      stopped = true
+  1785→      for (const node of loop.cleanup) {
+  1786→        try {
+  1787→          node.disconnect()
+  1788→        } catch {
+  1789→          /* ignore */
+  1790→        }
+  1791→      }
+  1792→    }
+  1793→    for (const s of loop.sources) {
+  1794→      s.onended = dispose
+  1795→      try {
+  1796→        s.stop(stopAt)
+  1797→      } catch {
+  1798→        /* ignore */
+  1799→      }
+  1800→    }
+  1801→  }
+  1802→
+  1803→  // ---------- spatial helpers ----------
+  1804→
+  1805→  private makePanner(pos: AudioPosition): PannerNode | null {
+  1806→    const ctx = this.ctx
+  1807→    if (!ctx) return null
+  1808→    try {
+  1809→      const p = ctx.createPanner()
+  1810→      p.panningModel = 'equalpower'
+  1811→      p.distanceModel = 'inverse'
+  1812→      p.refDistance = 3
+  1813→      p.rolloffFactor = 1.2
+  1814→      p.maxDistance = 10000
+  1815→      if (this.doppler) {
+  1816→        try {
+  1817→          // legacy knob, removed from modern spec typings — best effort only
+  1818→          const legacy = p as unknown as { dopplerFactor?: number }
+  1819→          legacy.dopplerFactor = 1
+  1820→        } catch {
+  1821→          /* not supported — fine */
+  1822→        }
+  1823→      }
+  1824→      this.setNodePos(p, pos)
+  1825→      return p
+  1826→    } catch {
+  1827→      return null
+  1828→    }
+  1829→  }
+  1830→
+  1831→  private setNodePos(p: PannerNode, pos: AudioPosition): void {
+  1832→    try {
+  1833→      if (p.positionX) {
+  1834→        p.positionX.value = pos.x
+  1835→        p.positionY.value = pos.y
+  1836→        p.positionZ.value = pos.z
+  1837→      } else {
+  1838→        p.setPosition(pos.x, pos.y, pos.z)
+  1839→      }
+  1840→    } catch {
+  1841→      /* ignore */
+  1842→    }
+  1843→  }
+  1844→
+  1845→  // ---------- one-shot infrastructure ----------
+  1846→
+  1847→  /** Gate + try/catch wrapper for fire-and-forget one-shots. */
+  1848→  private guard(fn: (ctx: AudioContext, master: GainNode) => void): void {
+  1849→    const ctx = this.ctx
+  1850→    const master = this.master
+  1851→    if (!this.ready || !ctx || !master) return
+  1852→    if (this.shots >= this.SHOT_CAP) return
+  1853→    try {
+  1854→      fn(ctx, master)
+  1855→    } catch {
+  1856→      /* audio must never throw into the game loop */
+  1857→    }
+  1858→  }
+  1859→
+  1860→  /** Registers one-shot sources for bounded lifetime + node cleanup. */
+  1861→  private trackShot(sources: AudioScheduledSourceNode[], cleanup: AudioNode[], stopAt: number): void {
+  1862→    this.shots++
+  1863→    let left = sources.length
+  1864→    const done = (): void => {
+  1865→      left -= 1
+  1866→      if (left > 0) return
+  1867→      this.shots = Math.max(0, this.shots - 1)
+  1868→      for (const n of cleanup) {
+  1869→        try {
+  1870→          n.disconnect()
+  1871→        } catch {
+  1872→          /* ignore */
+  1873→        }
+  1874→      }
+  1875→    }
+  1876→    for (const s of sources) {
+  1877→      s.onended = done
+  1878→      try {
+  1879→        s.stop(stopAt)
+  1880→      } catch {
+  1881→        /* ignore */
+  1882→      }
+  1883→    }
+  1884→  }
+  1885→
+  1886→  // simple node factories (only valid after init — callers gate on ready)
+  1887→  private noise(loop: boolean, which: 'white' | 'brown' = 'white'): AudioBufferSourceNode {
+  1888→    const ctx = this.ctx as AudioContext
+  1889→    const s = ctx.createBufferSource()
+  1890→    s.buffer = which === 'white' ? this.white : this.brown
+  1891→    s.loop = loop
+  1892→    return s
+  1893→  }
+  1894→
+  1895→  private bq(type: BiquadFilterType, freq: number, q?: number): BiquadFilterNode {
+  1896→    const ctx = this.ctx as AudioContext
+  1897→    const f = ctx.createBiquadFilter()
+  1898→    f.type = type
+  1899→    const nyq = ctx.sampleRate / 2 - 200
+  1900→    f.frequency.value = Math.max(10, Math.min(freq, nyq))
+  1901→    if (q !== undefined) f.Q.value = q
+  1902→    return f
+  1903→  }
+  1904→
+  1905→  private gn(v: number): GainNode {
+  1906→    const g = (this.ctx as AudioContext).createGain()
+  1907→    g.gain.value = v
+  1908→    return g
+  1909→  }
+  1910→
+  1911→  private osc(type: OscillatorType, freq: number): OscillatorNode {
+  1912→    const o = (this.ctx as AudioContext).createOscillator()
+  1913→    o.type = type
+  1914→    o.frequency.value = Math.max(1, freq)
+  1915→    return o
+  1916→  }
+  1917→
+  1918→  /** Generic short tone with soft envelope; optional exponential glide. */
+  1919→  private tone(
+  1920→    t: number,
+  1921→    freq: number,
+  1922→    dur: number,
+  1923→    vol: number,
+  1924→    type: OscillatorType = 'sine',
+  1925→    glideTo = 0
+  1926→  ): void {
+  1927→    const ctx = this.ctx
+  1928→    const master = this.master
+  1929→    if (!ctx || !master) return
+  1930→    const o = this.osc(type, freq)
+  1931→    const g = this.gn(0.0001)
+  1932→    o.connect(g)
+  1933→    g.connect(master)
+  1934→    g.gain.setValueAtTime(0.0001, t)
+  1935→    g.gain.linearRampToValueAtTime(vol, t + 0.018)
+  1936→    g.gain.setTargetAtTime(0.0001, t + dur * 0.55, Math.max(0.02, dur * 0.16))
+  1937→    if (glideTo > 0) {
+  1938→      o.frequency.setValueAtTime(Math.max(1, freq), t)
+  1939→      o.frequency.exponentialRampToValueAtTime(glideTo, t + dur * 0.9)
+  1940→    }
+  1941→    o.start(t)
+  1942→    this.trackShot([o], [o, g], t + dur + 0.4)
+  1943→  }
+  1944→
+  1945→  /** Tiny filtered-noise tick (squelch clicks, latch clicks). */
+  1946→  private click(t: number, freq: number, vol: number): void {
+  1947→    const ctx = this.ctx
+  1948→    const master = this.master
+  1949→    if (!ctx || !master) return
+  1950→    const src = this.noise(true, 'white')
+  1951→    const bp = this.bq('bandpass', freq, 1.4)
+  1952→    const g = this.gn(0.0001)
+  1953→    src.connect(bp)
+  1954→    bp.connect(g)
+  1955→    g.connect(master)
+  1956→    g.gain.setValueAtTime(0.0001, t)
+  1957→    g.gain.linearRampToValueAtTime(vol, t + 0.006)
+  1958→    g.gain.setTargetAtTime(0.0001, t + 0.008, 0.012)
+  1959→    src.start(t)
+  1960→    this.trackShot([src], [src, bp, g], t + 0.18)
+  1961→  }
+  1962→
+  1963→  /** Short low thump used to accent ratchet final clacks. */
+  1964→  private thumpTick(t: number, vol: number): void {
+  1965→    const ctx = this.ctx
+  1966→    const master = this.master
+  1967→    if (!ctx || !master) return
+  1968→    const o = this.osc('sine', 130)
+  1969→    const g = this.gn(0.0001)
+  1970→    o.connect(g)
+  1971→    g.connect(master)
+  1972→    o.frequency.setValueAtTime(130, t)
+  1973→    o.frequency.exponentialRampToValueAtTime(70, t + 0.08)
+  1974→    g.gain.setValueAtTime(0.0001, t)
+  1975→    g.gain.linearRampToValueAtTime(vol, t + 0.006)
+  1976→    g.gain.setTargetAtTime(0.0001, t + 0.01, 0.03)
+  1977→    o.start(t)
+  1978→    this.trackShot([o], [o, g], t + 0.3)
+  1979→  }
+  1980→
+  1981→  // ---------- scheduler (alarm + heartbeat) ----------
+  1982→
+  1983→  private schedTick(): void {
+  1984→    const ctx = this.ctx
+  1985→    if (!ctx || ctx.state !== 'running') return
+  1986→    const t = ctx.currentTime
+  1987→    if (this.alarmOn) {
+  1988→      if (t >= this.nextAlarmAt) {
+  1989→        this.alarmBeep(t + 0.06, this.alarmHi ? 880 : 660)
+  1990→        this.alarmHi = !this.alarmHi
+  1991→        this.nextAlarmAt = t + 1.2
+  1992→      }
+  1993→    } else {
+  1994→      this.nextAlarmAt = 0
+  1995→    }
+  1996→    if (this.heartLevel > 0.02) {
+  1997→      if (t >= this.nextHeartAt) {
+  1998→        this.heartBeat(t + 0.06)
+  1999→        const bpm = 60 + clamp01(this.heartLevel) * 72
+  2000→        this.nextHeartAt = t + 60 / bpm
+
+[showing lines 1-2000 of 2065; use offset=2001 with limit to continue reading]

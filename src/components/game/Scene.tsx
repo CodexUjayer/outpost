@@ -67,8 +67,9 @@ function AudioSync() {
       if (s.radioLine && s.radioLine.id !== radioId.current) {
         radioId.current = s.radioLine.id
         if (s.screen === 'playing') {
+          // blip only — the synthesized gibberish voice ("sho sho sho") is
+          // removed everywhere; radio text reads clean without it
           audio.radioBlip()
-          audio.radioVoice(2.6)
         }
       }
       // background music: user-supplied ambient track, started once and

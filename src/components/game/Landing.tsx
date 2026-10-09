@@ -45,8 +45,10 @@ const RADIO_LINES: [number, string][] = [
 ]
 
 // shot list — [start, end) with camera dolly from→to and framing params.
-// camAim: fraction of ship altitude added to the aim height (keeps the ship
-// framed with ground context); fov per shot for lens character.
+// from/to Y is authored as HEIGHT ABOVE THE LOCAL TERRAIN (the frame loop
+// samples heightAt under the live camera position) — a rolling dune can never
+// bury a shot again (the old "every scene after the first is underground" bug:
+// absolute Ys like 1.7 sat below the y≈3.36 pad soil).
 interface Shot {
   start: number
   end: number
@@ -57,14 +59,14 @@ interface Shot {
 }
 const SHOTS: Shot[] = [
   // 1 — ESTABLISH: high wide on the ridge, ship descending against the sky
-  { start: 0.0, end: 4.6, from: [46, 26, 52], to: [40, 21, 46], fov: 50, aimLift: 2.6 },
+  { start: 0.0, end: 4.6, from: [46, 17.5, 52], to: [40, 12, 46], fov: 50, aimLift: 2.6 },
   // 2 — LOW ANGLE: from the pad looking up as the ship swells overhead
-  { start: 4.6, end: 9.2, from: [15, 2.3, 21], to: [11.5, 1.9, 16.5], fov: 58, aimLift: 2.2 },
+  { start: 4.6, end: 9.2, from: [15, 1.9, 21], to: [11.5, 1.55, 16.5], fov: 58, aimLift: 2.2 },
   // 3 — TRACKING CLOSE: side profile through the dust storm, engine wash glowing
-  { start: 9.2, end: 13.6, from: [-14, 4.6, 18], to: [-10.5, 3.1, 12.5], fov: 55, aimLift: 2.0 },
+  { start: 9.2, end: 13.6, from: [-14, 2.5, 18], to: [-10.5, 2.1, 12.5], fov: 55, aimLift: 2.0 },
   // 4 — TOUCHDOWN: ground-level push-in on the landed ship, holds through the
   // final "go for base camp deployment" radio traffic, then fades out
-  { start: 13.6, end: DURATION, from: [6.8, 1.7, 9.2], to: [5.6, 1.45, 7.6], fov: 62, aimLift: 2.2 },
+  { start: 13.6, end: DURATION, from: [6.8, 1.6, 9.2], to: [5.6, 1.35, 7.6], fov: 62, aimLift: 2.2 },
 ]
 const CUT_WINDOWS = SHOTS.slice(1).map((s) => s.start) // 4.6, 9.2, 13.6
 const FADE_HALF = 0.22 // seconds each side of a cut spent inside the black dip
@@ -102,8 +104,9 @@ export default function LandingCinematic() {
 
   useEffect(() => {
     audio.landingBurn(true)
-    // the user-supplied mission-control chatter — LOUD
-    audio.setCutsceneChatter(true, 0.95)
+    // the user-supplied mission-control chatter — very loud, clearly above the
+    // engine rumble (the mix the user asked for: chatter > ship/engine sound)
+    audio.setCutsceneChatter(true, 1.5)
     const cam = camera as THREE.PerspectiveCamera
     return () => {
       audio.landingBurn(false)
@@ -182,13 +185,14 @@ export default function LandingCinematic() {
       fpState.shake = 1.4
       emitBurst([0, GROUND_Y + 0.4, 0], 70, { speed: 12, life: 2.8, size: 1.0, color: '#a89f90', up: 0.55 })
     }
-    // radio script (single pass — same timeline as the audio)
+    // radio script (single pass — same timeline as the audio). Text + blip
+    // only: the synthesized gibberish voice ("sho sho sho") is removed — the
+    // real mission-control chatter mp3 owns the voice channel.
     for (const [tt, text] of RADIO_LINES) {
       if (t >= tt && !radioFlags.current[tt]) {
         radioFlags.current[tt] = true
         st.radio(text)
         audio.radioBlip()
-        audio.radioVoice(2.4)
       }
     }
 
@@ -203,11 +207,14 @@ export default function LandingCinematic() {
     const lp = (t - shot.start) / (shot.end - shot.start) // local progress 0..1
     const ease = lp * lp * (3 - 2 * lp) // smoothstep dolly
     const shake = Math.max(0, fpState.shake) * (Math.random() - 0.5)
-    camera.position.set(
-      THREE.MathUtils.lerp(shot.from[0], shot.to[0], ease) + Math.sin(t * 0.7) * 0.22 + shake * 0.4,
-      THREE.MathUtils.lerp(shot.from[1], shot.to[1], ease) + Math.sin(t * 1.1) * 0.13 + shake * 0.4,
-      THREE.MathUtils.lerp(shot.from[2], shot.to[2], ease) + Math.cos(t * 0.5) * 0.22 + shake * 0.4,
-    )
+    const cx = THREE.MathUtils.lerp(shot.from[0], shot.to[0], ease) + Math.sin(t * 0.7) * 0.22 + shake * 0.4
+    const cz = THREE.MathUtils.lerp(shot.from[2], shot.to[2], ease) + Math.cos(t * 0.5) * 0.22 + shake * 0.4
+    // terrain-relative height: sample the ground UNDER the final (wobbled) XZ,
+    // then add the shot's above-terrain Y — with a hard "never below knee
+    // height over the soil" floor so no dune, rock or wobble can clip us under
+    const camGround = heightAt(cx, cz)
+    const cy = camGround + THREE.MathUtils.lerp(shot.from[1], shot.to[1], ease) + Math.sin(t * 1.1) * 0.13 + shake * 0.4
+    camera.position.set(cx, Math.max(cy, camGround + 0.9), cz)
     // the ship is ALWAYS the focus — aim tracks its live position
     aim.current.set(0, y + shot.aimLift, 0)
     camera.lookAt(aim.current.x, aim.current.y + shake * 0.2, aim.current.z)
